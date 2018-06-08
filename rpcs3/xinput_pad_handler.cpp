@@ -313,6 +313,8 @@ void xinput_pad_handler::Close()
 	}
 }
 
+#include "Emu/RSX/VK/DuranteFrameLimiter.h"
+
 void xinput_pad_handler::ThreadProc()
 {
 	for (auto &bind : bindings)
@@ -348,6 +350,18 @@ void xinput_pad_handler::ThreadProc()
 			}
 
 			std::array<u16, XInputKeyCodes::KeyCodeCount> button_values = GetButtonValues(state);
+			
+			if(button_values[XInputKeyCodes::RS]) {
+				if(!prev_rs_state[padnum]) {
+					DuranteFrameLimiter::get().toggleLimit();
+					prev_rs_state[padnum] = true;
+					//LOG_ERROR(HLE, "TOGGLE");
+				}
+			}
+			else {
+				prev_rs_state[padnum] = false;
+			}
+
 
 			// Translate any corresponding keycodes to our normal DS3 buttons and triggers
 			for (auto& btn : pad->m_buttons)
