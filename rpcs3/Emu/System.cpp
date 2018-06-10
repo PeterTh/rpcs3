@@ -1,5 +1,4 @@
 #include "stdafx.h"
-#include "Utilities/event.h"
 #include "Utilities/bin_patch.h"
 #include "Emu/Memory/Memory.h"
 #include "Emu/System.h"
@@ -13,26 +12,39 @@
 #include "Emu/Cell/RawSPUThread.h"
 #include "Emu/Cell/lv2/sys_sync.h"
 #include "Emu/Cell/lv2/sys_prx.h"
+#include "Emu/Cell/lv2/sys_rsx.h"
 
 #include "Emu/IdManager.h"
 #include "Emu/RSX/GSRender.h"
+#include "Emu/RSX/Capture/rsx_replay.h"
 
 #include "Loader/PSF.h"
 #include "Loader/ELF.h"
 
 #include "Utilities/StrUtil.h"
+#include "Utilities/sysinfo.h"
 
 #include "../Crypto/unself.h"
 #include "../Crypto/unpkg.h"
 #include "yaml-cpp/yaml.h"
 
+#include "cereal/archives/binary.hpp"
+
 #include <thread>
 #include <typeinfo>
 #include <queue>
+#include <fstream>
+#include <memory>
 
 #include "Utilities/GDBDebugServer.h"
 
+#if defined(_WIN32) || defined(HAVE_VULKAN)
+#include "Emu/RSX/VK/VulkanAPI.h"
+#endif
+
 cfg_root g_cfg;
+
+bool g_use_rtm = utils::has_rtm();
 
 std::string g_cfg_defaults;
 
@@ -50,6 +62,13 @@ extern void network_thread_init();
 
 fs::file g_tty;
 atomic_t<s64> g_tty_size{0};
+
+// Progress display server synchronization variables
+atomic_t<const char*> g_progr{nullptr};
+atomic_t<u64> g_progr_ftotal{0};
+atomic_t<u64> g_progr_fdone{0};
+atomic_t<u64> g_progr_ptotal{0};
+atomic_t<u64> g_progr_pdone{0};
 
 template <>
 void fmt_class_string<mouse_handler>::format(std::string& out, u64 arg)
@@ -186,6 +205,23 @@ void fmt_class_string<audio_renderer>::format(std::string& out, u64 arg)
 	});
 }
 
+template <>
+inline void fmt_class_string<detail_level>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](detail_level value)
+	{
+		switch (value)
+		{
+		case detail_level::minimal: return "Minimal";
+		case detail_level::low: return "Low";
+		case detail_level::medium: return "Medium";
+		case detail_level::high: return "High";
+		}
+
+		return unknown;
+	});
+}
+
 void Emulator::Init()
 {
 	if (!g_tty)
@@ -227,10 +263,149 @@ void Emulator::Init()
 	fs::create_path(dev_usb);
 
 #ifdef WITH_GDB_DEBUGGER
-	fxm::make<GDBDebugServer>();
+	LOG_SUCCESS(GENERAL, "GDB debug server will be started and listening on %d upon emulator boot", (int) g_cfg.misc.gdb_server_port);
 #endif
+
 	// Initialize patch engine
 	fxm::make_always<patch_engine>()->append(fs::get_config_dir() + "/patch.yml");
+
+	// Initialize progress dialog server (TODO)
+	if (g_progr.exchange("") == nullptr)
+	{
+		std::thread server([]()
+		{
+			while (true)
+			{
+				std::shared_ptr<MsgDialogBase> dlg;
+
+				// Wait for the start condition
+				while (!g_progr_ftotal && !g_progr_ptotal)
+				{
+					std::this_thread::sleep_for(5ms);
+				}
+
+				// Initialize message dialog
+				dlg = Emu.GetCallbacks().get_msg_dialog();
+				dlg->type.se_normal = true;
+				dlg->type.bg_invisible = true;
+				dlg->type.progress_bar_count = 1;
+				dlg->on_close = [](s32 status)
+				{
+					Emu.CallAfter([]()
+					{
+						// Abort everything
+						Emu.Stop();
+					});
+				};
+
+				Emu.CallAfter([=]()
+				{
+					dlg->Create(+g_progr);
+				});
+
+				u64 ftotal = 0;
+				u64 fdone = 0;
+				u64 ptotal = 0;
+				u64 pdone = 0;
+				u32 value = 0;
+
+				// Update progress
+				while (true)
+				{
+					if (ftotal != g_progr_ftotal || fdone != g_progr_fdone || ptotal != g_progr_ptotal || pdone != g_progr_pdone)
+					{
+						ftotal = g_progr_ftotal;
+						fdone = g_progr_fdone;
+						ptotal = g_progr_ptotal;
+						pdone = g_progr_pdone;
+
+						// Compute new progress in percents
+						const u32 new_value = ((ptotal ? pdone * 1. / ptotal : 0.) + fdone) * 100. / (ftotal ? ftotal : 1);
+
+						// Compute the difference
+						const u32 delta = new_value > value ? new_value - value : 0;
+
+						value += delta;
+
+						// Changes detected, send update
+						Emu.CallAfter([=]()
+						{
+							std::string progr = "Progress:";
+
+							if (ftotal)
+								fmt::append(progr, " file %u of %u%s", fdone, ftotal, ptotal ? "," : "");
+							if (ptotal)
+								fmt::append(progr, " module %u of %u", pdone, ptotal);
+
+							dlg->SetMsg(+g_progr);
+							dlg->ProgressBarSetMsg(0, progr);
+							dlg->ProgressBarInc(0, delta);
+						});
+					}
+
+					if (fdone >= ftotal && pdone >= ptotal)
+					{
+						// Close dialog
+						break;
+					}
+
+					std::this_thread::sleep_for(10ms);
+				}
+
+				// Cleanup
+				g_progr_ftotal -= fdone;
+				g_progr_fdone  -= fdone;
+				g_progr_ptotal -= pdone;
+				g_progr_pdone  -= pdone;
+			}
+		});
+
+		server.detach();
+	}
+}
+
+bool Emulator::BootRsxCapture(const std::string& path)
+{
+	if (!fs::is_file(path))
+		return false;
+
+	std::fstream f(path, std::ios::in | std::ios::binary);
+
+	cereal::BinaryInputArchive archive(f);
+	std::unique_ptr<rsx::frame_capture_data> frame = std::make_unique<rsx::frame_capture_data>();
+	archive(*frame);
+
+	if (frame->magic != rsx::FRAME_CAPTURE_MAGIC)
+	{
+		LOG_ERROR(LOADER, "Invalid rsx capture file!");
+		return false;
+	}
+
+	if (frame->version != rsx::FRAME_CAPTURE_VERSION)
+	{
+		LOG_ERROR(LOADER, "Rsx capture file version not supported! Expected %d, found %d", rsx::FRAME_CAPTURE_VERSION, frame->version);
+		return false;
+	}
+
+	Init();
+
+	vm::init();
+
+	// PS3 'executable'
+	m_state = system_state::ready;
+	GetCallbacks().on_ready();
+
+	auto gsrender = fxm::import<GSRender>(Emu.GetCallbacks().get_gs_render);
+	if (gsrender.get() == nullptr)
+		return false;
+
+	GetCallbacks().on_run();
+	m_state = system_state::running;
+
+	auto&& rsxcapture = idm::make_ptr<ppu_thread, rsx::rsx_replay_thread>(std::move(frame));
+	rsxcapture->run();
+
+	return true;
 }
 
 bool Emulator::BootGame(const std::string& path, bool direct, bool add_only)
@@ -297,8 +472,6 @@ bool Emulator::InstallPkg(const std::string& path)
 				int_progress = static_cast<int>(pval);
 				LOG_SUCCESS(GENERAL, "... %u%%", int_progress);
 			}
-
-			m_cb.process_events();
 		}
 	}
 
@@ -395,6 +568,13 @@ void Emulator::Load(bool add_only)
 		m_title_id = psf::get_string(_psf, "TITLE_ID");
 		m_cat = psf::get_string(_psf, "CATEGORY");
 
+		for (auto& c : m_title)
+		{
+			// Replace newlines with spaces
+			if (c == '\n')
+				c = ' ';
+		}
+
 		if (!_psf.empty() && m_cat.empty())
 		{
 			LOG_FATAL(LOADER, "Corrupted PARAM.SFO found! Assuming category GD. Try reinstalling the game.");
@@ -438,6 +618,13 @@ void Emulator::Load(bool add_only)
 			g_cfg.from_string(cfg_file.to_string());
 		}
 
+#if defined(_WIN32) || defined(HAVE_VULKAN)
+		if (g_cfg.video.renderer == video_renderer::vulkan)
+		{
+			LOG_NOTICE(LOADER, "Vulkan SDK Revision: %d", VK_HEADER_VERSION);
+		}
+#endif
+
 		LOG_NOTICE(LOADER, "Used configuration:\n%s\n", g_cfg.to_string());
 
 		// Load patches from different locations
@@ -478,8 +665,14 @@ void Emulator::Load(bool add_only)
 				std::vector<std::string> dir_queue;
 				dir_queue.emplace_back(m_path + '/');
 
+				std::vector<std::pair<std::string, u64>> file_queue;
+				file_queue.reserve(2000);
+
 				std::queue<std::shared_ptr<thread_ctrl>> thread_queue;
 				const uint max_threads = std::thread::hardware_concurrency();
+
+				// Initialize progress dialog
+				g_progr = "Scanning directories for SPRX libraries...";
 
 				// Find all .sprx files recursively (TODO: process .mself files)
 				for (std::size_t i = 0; i < dir_queue.size(); i++)
@@ -517,37 +710,53 @@ void Emulator::Load(bool add_only)
 							}
 
 							// Get full path
-							const std::string path = dir_queue[i] + entry.name;
-
-							LOG_NOTICE(LOADER, "Trying to load SPRX: %s", path);
-
-							// Some files may fail to decrypt due to the lack of klic
-							const ppu_prx_object obj = decrypt_self(fs::file(path));
-
-							if (obj == elf_error::ok)
-							{
-								if (auto prx = ppu_load_prx(obj, path))
-								{
-									while (g_thread_count >= max_threads + 2)
-									{
-										std::this_thread::sleep_for(10ms);
-									}
-
-									thread_queue.emplace();
-
-									thread_ctrl::spawn(thread_queue.back(), "Worker " + std::to_string(thread_queue.size()), [_prx = std::move(prx)]
-									{
-										ppu_initialize(*_prx);
-										ppu_unload_prx(*_prx);
-									});
-								}
-							}
-							else
-							{
-								LOG_ERROR(LOADER, "Failed to load SPRX '%s' (%s)", path, obj.get_error());
-							}
+							file_queue.emplace_back(dir_queue[i] + entry.name, 0);
+							g_progr_ftotal++;
 						}
 					}
+				}
+
+				for (std::size_t i = 0; i < file_queue.size(); i++)
+				{
+					const auto& path = file_queue[i].first;
+
+					LOG_NOTICE(LOADER, "Trying to load SPRX: %s", path);
+
+					// Load MSELF or SPRX
+					fs::file src{path};
+
+					if (file_queue[i].second == 0)
+					{
+						// Some files may fail to decrypt due to the lack of klic
+						src = decrypt_self(std::move(src));
+					}
+
+					const ppu_prx_object obj = src;
+
+					if (obj == elf_error::ok)
+					{
+						if (auto prx = ppu_load_prx(obj, path))
+						{
+							while (g_thread_count >= max_threads + 2)
+							{
+								std::this_thread::sleep_for(10ms);
+							}
+
+							thread_queue.emplace();
+
+							thread_ctrl::spawn(thread_queue.back(), "Worker " + std::to_string(thread_queue.size()), [_prx = std::move(prx)]
+							{
+								ppu_initialize(*_prx);
+								ppu_unload_prx(*_prx);
+								g_progr_fdone++;
+							});
+
+							continue;
+						}
+					}
+
+					LOG_ERROR(LOADER, "Failed to load SPRX '%s' (%s)", path, obj.get_error());
+					g_progr_fdone++;
 				}
 
 				// Join every thread and print exceptions
@@ -849,12 +1058,6 @@ void Emulator::Load(bool add_only)
 				LOG_NOTICE(LOADER, "Elf path: %s", argv[0]);
 			}
 
-			if (g_cfg.core.spu_debug)
-			{
-				fs::file log(Emu.GetCachePath() + "SPUJIT.log", fs::rewrite);
-				log.write(fmt::format("SPU JIT Log\n\nTitle: %s\nTitle ID: %s\n\n", Emu.GetTitle(), Emu.GetTitleID()));
-			}
-
 			ppu_load_exec(ppu_exec);
 
 			fxm::import<GSRender>(Emu.GetCallbacks().get_gs_render); // TODO: must be created in appropriate sys_rsx syscall
@@ -934,6 +1137,11 @@ void Emulator::Run()
 	idm::select<ppu_thread>(on_select);
 	idm::select<RawSPUThread>(on_select);
 	idm::select<SPUThread>(on_select);
+
+#ifdef WITH_GDB_DEBUGGER
+	// Initialize debug server at the end of emu run sequence
+	fxm::make<GDBDebugServer>();
+#endif
 }
 
 bool Emulator::Pause()
@@ -1072,8 +1280,6 @@ void Emulator::Stop(bool restart)
 
 	while (g_thread_count)
 	{
-		m_cb.process_events();
-
 		std::this_thread::sleep_for(10ms);
 	}
 

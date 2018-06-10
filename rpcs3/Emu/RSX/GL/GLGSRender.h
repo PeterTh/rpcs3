@@ -35,15 +35,23 @@ namespace gl
 
 struct work_item
 {
-	std::condition_variable cv;
-	std::mutex guard_mutex;
-
 	u32  address_to_flush = 0;
 	gl::texture_cache::thrashed_set section_data;
 
 	volatile bool processed = false;
 	volatile bool result = false;
 	volatile bool received = false;
+
+	void producer_wait()
+	{
+		while (!processed)
+		{
+			_mm_lfence();
+			std::this_thread::yield();
+		}
+
+		received = true;
+	}
 };
 
 struct driver_state
@@ -290,6 +298,9 @@ private:
 	std::unique_ptr<gl::ring_buffer> m_vertex_state_buffer;
 	std::unique_ptr<gl::ring_buffer> m_index_ring_buffer;
 
+	// Identity buffer used to fix broken gl_VertexID on ATI stack
+	std::unique_ptr<gl::buffer> m_identity_index_buffer;
+
 	u32 m_draw_calls = 0;
 	s64 m_begin_time = 0;
 	s64 m_draw_time = 0;
@@ -309,8 +320,6 @@ private:
 	gl::depth_convert_pass m_depth_converter;
 	gl::ui_overlay_renderer m_ui_renderer;
 	gl::video_out_calibration_pass m_video_output_pass;
-
-	std::vector<u64> m_overlay_cleanup_requests;
 
 	shared_mutex queue_guard;
 	std::list<work_item> work_queue;
@@ -334,6 +343,7 @@ private:
 	std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
 	std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};
 	std::unordered_map<GLenum, std::unique_ptr<gl::texture>> m_null_textures;
+	std::vector<u8> m_scratch_buffer;
 
 public:
 	GLGSRender();
@@ -379,14 +389,12 @@ protected:
 	bool do_method(u32 id, u32 arg) override;
 	void flip(int buffer) override;
 
-	void do_local_task(bool idle) override;
+	void do_local_task(rsx::FIFO_state state) override;
 
 	bool on_access_violation(u32 address, bool is_writing) override;
-	void on_notify_memory_unmapped(u32 address_base, u32 size) override;
+	void on_invalidate_memory_range(u32 address_base, u32 size) override;
 	void notify_tile_unbound(u32 tile) override;
 
 	std::array<std::vector<gsl::byte>, 4> copy_render_targets_to_memory() override;
 	std::array<std::vector<gsl::byte>, 2> copy_depth_stencil_buffer_to_memory() override;
-
-	void shell_do_cleanup() override;
 };

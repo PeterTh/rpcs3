@@ -26,15 +26,17 @@ If you want to contribute please take a look at the [Coding Style](https://githu
 * [Python 3.3+](https://www.python.org/downloads/) (required; add to PATH)
 * [Qt 5.10+](https://www.qt.io/download-open-source/) (required; add QTDIR environment variable if you do not want to use the Visual Studio Qt Plugin: e.g. `<QtInstallFolder>\5.10.1\msvc2015_64\`)
 * [Visual Studio Qt Plugin](https://marketplace.visualstudio.com/items?itemName=TheQtCompany.QtVisualStudioTools2015) (optional; see above)
+* [Vulkan SDK](https://sdk.lunarg.com/sdk/download/1.1.73.0/windows/VulkanSDK-1.1.73.0-Installer.exe) (required)
 
 ### Linux
 * [Qt 5.10+](https://www.qt.io/download-open-source/)
 * GCC 5.1+ or Clang 3.5.0+ ([not GCC 6.1](https://github.com/RPCS3/rpcs3/issues/1691))
 * Debian & Ubuntu: `sudo apt-get install cmake build-essential libasound2-dev libpulse-dev libopenal-dev libglew-dev zlib1g-dev libedit-dev libvulkan-dev libudev-dev git qt5-default`
-* Arch: `sudo pacman -S glew openal cmake llvm qt5-base`
-* Fedora: `sudo dnf install cmake glew glew-devel libatomic libudev-devel openal-devel qt5-devel vulkan-devel`
+* Arch: `sudo pacman -S glew openal cmake vulkan-validation-layers qt5-base`
+* Fedora: `sudo dnf install alsa-lib-devel cmake glew glew-devel libatomic libevdev-devel libudev-devel openal-devel qt5-devel vulkan-devel`
 * OpenSUSE: `sudo zypper install git cmake libasound2 libpulse-devel openal-soft-devel glew-devel zlib-devel libedit-devel vulkan-devel libudev-devel libqt5-qtbase-devel libevdev-devel`
-**If you have a NVIDIA GPU, you may need to install the libglvnd package.**
+
+**If you have an NVIDIA GPU, you may need to install the libglvnd package.**
 
 ### MacOS
 MacOS is not supported at this moment because it doesn't meet system requirements (OpenGL 4.3)

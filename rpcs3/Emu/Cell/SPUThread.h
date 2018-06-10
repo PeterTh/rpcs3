@@ -378,24 +378,20 @@ struct spu_int_ctrl_t
 
 struct spu_imm_table_t
 {
-	v128 fsmb[65536]; // table for FSMB, FSMBI instructions
-	v128 fsmh[256]; // table for FSMH instruction
-	v128 fsm[16]; // table for FSM instruction
-
 	v128 sldq_pshufb[32]; // table for SHLQBYBI, SHLQBY, SHLQBYI instructions
 	v128 srdq_pshufb[32]; // table for ROTQMBYBI, ROTQMBY, ROTQMBYI instructions
 	v128 rldq_pshufb[16]; // table for ROTQBYBI, ROTQBY, ROTQBYI instructions
 
 	class scale_table_t
 	{
-		std::array<__m128, 155 + 174> m_data;
+		std::array<v128, 155 + 174> m_data;
 
 	public:
 		scale_table_t();
 
 		FORCE_INLINE __m128 operator [] (s32 scale) const
 		{
-			return m_data[scale + 155];
+			return m_data[scale + 155].vf;
 		}
 	}
 	const scale;
@@ -584,10 +580,6 @@ public:
 
 	const std::string m_name; // Thread name
 
-	u64 tx_success = 0;
-	u64 tx_failure = 0;
-	uint tx_status = 0;
-
 	std::unique_ptr<class spu_recompiler_base> jit; // Recompiler instance
 
 	u64 block_counter = 0;
@@ -595,6 +587,8 @@ public:
 	u64 block_failure = 0;
 
 	std::array<spu_function_t, 0x10000> jit_dispatcher; // Dispatch table for indirect calls
+
+	std::array<v128, 0x4000> stack_mirror; // Return address information
 
 	void push_snr(u32 number, u32 value);
 	void do_dma_transfer(const spu_mfc_cmd& args);
@@ -609,7 +603,7 @@ public:
 	void set_events(u32 mask);
 	void set_interrupt_status(bool enable);
 	u32 get_ch_count(u32 ch);
-	bool get_ch_value(u32 ch, u32& out);
+	s64 get_ch_value(u32 ch);
 	bool set_ch_value(u32 ch, u32 value);
 	bool stop_and_signal(u32 code);
 	void halt();

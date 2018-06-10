@@ -24,14 +24,14 @@ namespace
 
 GLGSRender::GLGSRender() : GSRender()
 {
-	m_shaders_cache.reset(new gl::shader_cache(m_prog_buffer, "opengl", "v1.2"));
+	m_shaders_cache.reset(new gl::shader_cache(m_prog_buffer, "opengl", "v1.3"));
 
 	if (g_cfg.video.disable_vertex_cache)
 		m_vertex_cache.reset(new gl::null_vertex_cache());
 	else
 		m_vertex_cache.reset(new gl::weak_vertex_cache());
 
-	supports_multidraw = !g_cfg.video.strict_rendering_mode;
+	supports_multidraw = true;
 	supports_native_ui = (bool)g_cfg.misc.use_native_interface;
 }
 
@@ -193,7 +193,7 @@ void GLGSRender::end()
 
 	if (manually_flush_ring_buffers)
 	{
-		//Use approximations to reseve space. This path is mostly for debug purposes anyway
+		//Use approximations to reserve space. This path is mostly for debug purposes anyway
 		u32 approx_vertex_count = rsx::method_registers.current_draw_clause.get_elements_count();
 		u32 approx_working_buffer_size = approx_vertex_count * 256;
 
@@ -207,24 +207,19 @@ void GLGSRender::end()
 
 	//Check if depth buffer is bound and valid
 	//If ds is not initialized clear it; it seems new depth textures should have depth cleared
-	auto copy_rtt_contents = [](gl::render_target *surface)
+	auto copy_rtt_contents = [](gl::render_target *surface, bool is_depth)
 	{
 		if (surface->get_internal_format() == surface->old_contents->get_internal_format())
 		{
 			//Copy data from old contents onto this one
-			//1. Clip a rectangular region defning the data
-			//2. Perform a GPU blit
-			u16 parent_w = surface->old_contents->width();
-			u16 parent_h = surface->old_contents->height();
-			u16 copy_w, copy_h;
+			const auto region = rsx::get_transferable_region(surface);
+			gl::g_hw_blitter->scale_image(surface->old_contents, surface, { 0, 0, std::get<0>(region), std::get<1>(region) }, { 0, 0, std::get<2>(region) , std::get<3>(region) }, !is_depth, is_depth, {});
 
-			std::tie(std::ignore, std::ignore, copy_w, copy_h) = rsx::clip_region<u16>(parent_w, parent_h, 0, 0, surface->width(), surface->height(), true);
-			glCopyImageSubData(surface->old_contents->id(), GL_TEXTURE_2D, 0, 0, 0, 0, surface->id(), GL_TEXTURE_2D, 0, 0, 0, 0, copy_w, copy_h, 1);
-			surface->set_cleared();
+			// Memory has been transferred, discard old contents and update memory flags
+			// TODO: Preserve memory outside surface clip region
+			surface->on_write();
 		}
 		//TODO: download image contents and reupload them or do a memory cast to copy memory contents if not compatible
-
-		surface->old_contents = nullptr;
 	};
 
 	//Check if we have any 'recycled' surfaces in memory and if so, clear them
@@ -272,42 +267,36 @@ void GLGSRender::end()
 		if (buffers_to_clear.size() > 0 && !clear_all_color)
 		{
 			GLfloat colors[] = { 0.f, 0.f, 0.f, 0.f };
-			//It is impossible for the render target to be typa A or B here (clear all would have been flagged)
+			//It is impossible for the render target to be type A or B here (clear all would have been flagged)
 			for (auto &i : buffers_to_clear)
 				glClearBufferfv(draw_fbo.id(), i, colors);
 		}
 
 		if (clear_depth)
 			gl_state.depth_mask(rsx::method_registers.depth_write_enabled());
-
-		ds->set_cleared();
 	}
 
-	if (ds && ds->old_contents != nullptr && ds->get_rsx_pitch() == ds->old_contents->get_rsx_pitch() &&
+	if (ds && ds->old_contents != nullptr && ds->get_rsx_pitch() == static_cast<gl::render_target*>(ds->old_contents)->get_rsx_pitch() &&
 		ds->old_contents->get_internal_format() == gl::texture::internal_format::rgba8)
 	{
+		// TODO: Partial memory transfer
 		m_depth_converter.run(ds->width(), ds->height(), ds->id(), ds->old_contents->id());
-		ds->old_contents = nullptr;
+		ds->on_write();
 	}
 
 	if (g_cfg.video.strict_rendering_mode)
 	{
 		if (ds && ds->old_contents != nullptr)
-			copy_rtt_contents(ds);
+			copy_rtt_contents(ds, true);
 
 		for (auto &rtt : m_rtts.m_bound_render_targets)
 		{
 			if (auto surface = std::get<1>(rtt))
 			{
 				if (surface->old_contents != nullptr)
-					copy_rtt_contents(surface);
+					copy_rtt_contents(surface, false);
 			}
 		}
-	}
-	else
-	{
-		// Old contents are one use only. Keep the depth conversion check from firing over and over
-		if (ds) ds->old_contents = nullptr;
 	}
 
 	glEnable(GL_SCISSOR_TEST);
@@ -476,7 +465,10 @@ void GLGSRender::end()
 	}
 
 	const GLenum draw_mode = gl::draw_mode(rsx::method_registers.current_draw_clause.primitive);
-	bool single_draw = !supports_multidraw || (rsx::method_registers.current_draw_clause.first_count_commands.size() <= 1 || rsx::method_registers.current_draw_clause.is_disjoint_primitive);
+	const bool allow_multidraw = supports_multidraw && !g_cfg.video.disable_FIFO_reordering;
+	const bool single_draw = (!allow_multidraw ||
+		rsx::method_registers.current_draw_clause.first_count_commands.size() <= 1 ||
+		rsx::method_registers.current_draw_clause.is_disjoint_primitive);
 
 	if (upload_info.index_info)
 	{
@@ -489,32 +481,33 @@ void GLGSRender::end()
 			glPrimitiveRestartIndex((index_type == GL_UNSIGNED_SHORT)? 0xffff: 0xffffffff);
 		}
 
+		m_index_ring_buffer->bind();
+
 		if (single_draw)
 		{
 			glDrawElements(draw_mode, upload_info.vertex_draw_count, index_type, (GLvoid *)(uintptr_t)index_offset);
 		}
 		else
 		{
-			std::vector<GLsizei> counts;
-			std::vector<const GLvoid*> offsets;
-
 			const auto draw_count = rsx::method_registers.current_draw_clause.first_count_commands.size();
 			const u32 type_scale = (index_type == GL_UNSIGNED_SHORT) ? 1 : 2;
 			uintptr_t index_ptr = index_offset;
+			m_scratch_buffer.resize(draw_count * 16);
 
-			counts.reserve(draw_count);
-			offsets.reserve(draw_count);
+			GLsizei *counts = (GLsizei*)m_scratch_buffer.data();
+			const GLvoid** offsets = (const GLvoid**)(counts + draw_count);
+			int dst_index = 0;
 
 			for (const auto &range : rsx::method_registers.current_draw_clause.first_count_commands)
 			{
 				const auto index_size = get_index_count(rsx::method_registers.current_draw_clause.primitive, range.second);
-				counts.push_back(index_size);
-				offsets.push_back((const GLvoid*)index_ptr);
+				counts[dst_index] = index_size;
+				offsets[dst_index++] = (const GLvoid*)index_ptr;
 
 				index_ptr += (index_size << type_scale);
 			}
 
-			glMultiDrawElements(draw_mode, counts.data(), index_type, offsets.data(), (GLsizei)draw_count);
+			glMultiDrawElements(draw_mode, counts, index_type, offsets, (GLsizei)draw_count);
 		}
 	}
 	else
@@ -525,25 +518,36 @@ void GLGSRender::end()
 		}
 		else
 		{
-			u32 base_index = rsx::method_registers.current_draw_clause.first_count_commands.front().first;
-			if (gl::get_driver_caps().vendor_AMD == false)
+			const u32 base_index = rsx::method_registers.current_draw_clause.first_count_commands.front().first;
+			bool use_draw_arrays_fallback = false;
+
+			const auto draw_count = rsx::method_registers.current_draw_clause.first_count_commands.size();
+			const auto driver_caps = gl::get_driver_caps();
+
+			m_scratch_buffer.resize(draw_count * 24);
+			GLint* firsts = (GLint*)m_scratch_buffer.data();
+			GLsizei* counts = (GLsizei*)(firsts + draw_count);
+			const GLvoid** offsets = (const GLvoid**)(counts + draw_count);
+			int dst_index = 0;
+
+			for (const auto &range : rsx::method_registers.current_draw_clause.first_count_commands)
 			{
-				std::vector<GLint> firsts;
-				std::vector<GLsizei> counts;
-				const auto draw_count = rsx::method_registers.current_draw_clause.first_count_commands.size();
+				const GLint first = range.first - base_index;
+				const GLsizei count = range.second;
 
-				firsts.reserve(draw_count);
-				counts.reserve(draw_count);
+				firsts[dst_index] = first;
+				counts[dst_index] = count;
+				offsets[dst_index++] = (const GLvoid*)(first << 2);
 
-				for (const auto &range : rsx::method_registers.current_draw_clause.first_count_commands)
+				if (driver_caps.vendor_AMD && (first + count) > (0x100000 >> 2))
 				{
-					firsts.push_back(range.first - base_index);
-					counts.push_back(range.second);
+					//Unlikely, but added here in case the identity buffer is not large enough somehow
+					use_draw_arrays_fallback = true;
+					break;
 				}
-
-				glMultiDrawArrays(draw_mode, firsts.data(), counts.data(), (GLsizei)draw_count);
 			}
-			else
+
+			if (use_draw_arrays_fallback)
 			{
 				//MultiDrawArrays is broken on some primitive types using AMD. One known type is GL_TRIANGLE_STRIP but there could be more
 				for (const auto &range : rsx::method_registers.current_draw_clause.first_count_commands)
@@ -551,8 +555,21 @@ void GLGSRender::end()
 					glDrawArrays(draw_mode, range.first - base_index, range.second);
 				}
 			}
+			else if (driver_caps.vendor_AMD)
+			{
+				//Use identity index buffer to fix broken vertexID on AMD
+				m_identity_index_buffer->bind();
+				glMultiDrawElements(draw_mode, counts, GL_UNSIGNED_INT, offsets, (GLsizei)draw_count);
+			}
+			else
+			{
+				//Normal render
+				glMultiDrawArrays(draw_mode, firsts, counts, (GLsizei)draw_count);
+			}
 		}
 	}
+
+	m_rtts.on_write();
 
 	m_attrib_ring_buffer->notify();
 	m_index_ring_buffer->notify();
@@ -610,9 +627,9 @@ void GLGSRender::on_init_thread()
 	if (g_cfg.video.debug_output)
 		gl::enable_debugging();
 
-	LOG_NOTICE(RSX, "%s", (const char*)glGetString(GL_VERSION));
-	LOG_NOTICE(RSX, "%s", (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION));
-	LOG_NOTICE(RSX, "%s", (const char*)glGetString(GL_VENDOR));
+	LOG_NOTICE(RSX, "GL RENDERER: %s (%s)", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VENDOR));
+	LOG_NOTICE(RSX, "GL VERSION: %s", (const char*)glGetString(GL_VERSION));
+	LOG_NOTICE(RSX, "GLSL VERSION: %s", (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION));
 
 	auto& gl_caps = gl::get_driver_caps();
 
@@ -733,6 +750,21 @@ void GLGSRender::on_init_thread()
 	m_fragment_constants_buffer->create(gl::buffer::target::uniform, 16 * 0x100000);
 	m_vertex_state_buffer->create(gl::buffer::target::uniform, 16 * 0x100000);
 
+	if (gl_caps.vendor_AMD)
+	{
+		m_identity_index_buffer.reset(new gl::buffer);
+		m_identity_index_buffer->create(gl::buffer::target::element_array, 1 * 0x100000);
+
+		// Initialize with 256k identity entries
+		auto *dst = (u32*)m_identity_index_buffer->map(gl::buffer::access::write);
+		for (u32 n = 0; n < (0x100000 >> 2); ++n)
+		{
+			dst[n] = n;
+		}
+
+		m_identity_index_buffer->unmap();
+	}
+
 	m_persistent_stream_view.update(m_attrib_ring_buffer.get(), 0, std::min<u32>((u32)m_attrib_ring_buffer->size(), m_max_texbuffer_size));
 	m_volatile_stream_view.update(m_attrib_ring_buffer.get(), 0, std::min<u32>((u32)m_attrib_ring_buffer->size(), m_max_texbuffer_size));
 	m_gl_persistent_stream_buffer->copy_from(m_persistent_stream_view);
@@ -807,9 +839,10 @@ void GLGSRender::on_init_thread()
 			{
 				MsgDialogType type = {};
 				type.disable_cancel = true;
-				type.progress_bar_count = 1;
+				type.progress_bar_count = 2;
 
-				dlg = owner->shell_open_message_dialog();
+				dlg = fxm::get<rsx::overlays::display_manager>()->create<rsx::overlays::message_dialog>();
+				dlg->progress_bar_set_taskbar_index(-1);
 				dlg->show("Loading precompiled shaders from disk...", type, [](s32 status)
 				{
 					if (status != CELL_OK)
@@ -817,15 +850,22 @@ void GLGSRender::on_init_thread()
 				});
 			}
 
-			void update_msg(u32 processed, u32 entry_count) override
+			void update_msg(u32 index, u32 processed, u32 entry_count) override
 			{
-				dlg->progress_bar_set_message(0, fmt::format("Loading pipeline object %u of %u", processed, entry_count));
+				const char *text = index == 0 ? "Loading pipeline object %u of %u" : "Compiling pipeline object %u of %u";
+				dlg->progress_bar_set_message(index, fmt::format(text, processed, entry_count));
 				owner->flip(0);
 			}
 
-			void inc_value(u32 value) override
+			void inc_value(u32 index, u32 value) override
 			{
-				dlg->progress_bar_increment(0, (f32)value);
+				dlg->progress_bar_increment(index, (f32)value);
+				owner->flip(0);
+			}
+
+			void set_limit(u32 index, u32 limit) override
+			{
+				dlg->progress_bar_set_limit(index, limit);
 				owner->flip(0);
 			}
 
@@ -902,6 +942,11 @@ void GLGSRender::on_exit()
 		m_index_ring_buffer->remove();
 	}
 
+	if (m_identity_index_buffer)
+	{
+		m_identity_index_buffer->remove();
+	}
+
 	m_null_textures.clear();
 	m_text_printer.close();
 	m_gl_texture_cache.destroy();
@@ -944,11 +989,9 @@ void GLGSRender::clear_surface(u32 arg)
 		gl_state.clear_depth(f32(clear_depth) / max_depth_value);
 		mask |= GLenum(gl::buffers::depth);
 
-		gl::render_target *ds = std::get<1>(m_rtts.m_bound_depth_stencil);
-		if (ds && !ds->cleared())
+		if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil))
 		{
-			ds->set_cleared();
-			ds->old_contents = nullptr;
+			ds->on_write();
 		}
 	}
 
@@ -992,10 +1035,9 @@ void GLGSRender::clear_surface(u32 arg)
 
 			for (auto &rtt : m_rtts.m_bound_render_targets)
 			{
-				if (std::get<0>(rtt) != 0)
+				if (auto surface = std::get<1>(rtt))
 				{
-					std::get<1>(rtt)->set_cleared(true);
-					std::get<1>(rtt)->old_contents = nullptr;
+					surface->on_write();
 				}
 			}
 
@@ -1049,37 +1091,40 @@ bool GLGSRender::check_program_state()
 
 void GLGSRender::load_program(const gl::vertex_upload_info& upload_info)
 {
-	get_current_fragment_program(fs_sampler_state);
-	verify(HERE), current_fragment_program.valid;
-
-	get_current_vertex_program();
-
-	auto &fragment_program = current_fragment_program;
-	auto &vertex_program = current_vertex_program;
-
-	vertex_program.skip_vertex_input_check = true;	//not needed for us since decoding is done server side
-	fragment_program.unnormalized_coords = 0; //unused
-	void* pipeline_properties = nullptr;
-
-	m_program = &m_prog_buffer.getGraphicPipelineState(vertex_program, fragment_program, pipeline_properties);
-	m_program->use();
-
-	if (m_prog_buffer.check_cache_missed())
+	if (m_graphics_state & rsx::pipeline_state::invalidate_pipeline_bits)
 	{
-		m_shaders_cache->store(pipeline_properties, vertex_program, fragment_program);
+		get_current_fragment_program(fs_sampler_state);
+		verify(HERE), current_fragment_program.valid;
 
-		//Notify the user with HUD notification
-		if (g_cfg.misc.show_shader_compilation_hint)
+		get_current_vertex_program();
+
+		current_vertex_program.skip_vertex_input_check = true;	//not needed for us since decoding is done server side
+		current_fragment_program.unnormalized_coords = 0; //unused
+		void* pipeline_properties = nullptr;
+
+		m_program = &m_prog_buffer.getGraphicPipelineState(current_vertex_program, current_fragment_program, pipeline_properties);
+		m_program->use();
+
+		if (m_prog_buffer.check_cache_missed())
 		{
-			if (!m_custom_ui)
+			m_shaders_cache->store(pipeline_properties, current_vertex_program, current_fragment_program);
+
+			//Notify the user with HUD notification
+			if (g_cfg.misc.show_shader_compilation_hint)
 			{
-				//Create notification but do not draw it at this time. No need to spam flip requests
-				m_custom_ui = std::make_unique<rsx::overlays::shader_compile_notification>();
-			}
-			else if (auto casted = dynamic_cast<rsx::overlays::shader_compile_notification*>(m_custom_ui.get()))
-			{
-				//Probe the notification
-				casted->touch();
+				if (m_overlay_manager)
+				{
+					if (auto dlg = m_overlay_manager->get<rsx::overlays::shader_compile_notification>())
+					{
+						//Extend duration
+						dlg->touch();
+					}
+					else
+					{
+						//Create dialog but do not show immediately
+						m_overlay_manager->create<rsx::overlays::shader_compile_notification>();
+					}
+				}
 			}
 		}
 	}
@@ -1089,14 +1134,15 @@ void GLGSRender::load_program(const gl::vertex_upload_info& upload_info)
 	u32 vertex_constants_offset;
 	u32 fragment_constants_offset;
 
-	const u32 fragment_constants_size = (const u32)m_prog_buffer.get_fragment_constants_buffer_size(fragment_program);
+	const u32 fragment_constants_size = (const u32)m_prog_buffer.get_fragment_constants_buffer_size(current_fragment_program);
 	const u32 fragment_buffer_size = fragment_constants_size + (18 * 4 * sizeof(float));
+	const bool update_transform_constants = !!(m_graphics_state & rsx::pipeline_state::transform_constants_dirty);
 
 	if (manually_flush_ring_buffers)
 	{
 		m_vertex_state_buffer->reserve_storage_on_heap(512);
 		m_fragment_constants_buffer->reserve_storage_on_heap(align(fragment_buffer_size, 256));
-		if (m_transform_constants_dirty) m_transform_constants_buffer->reserve_storage_on_heap(8192);
+		if (update_transform_constants) m_transform_constants_buffer->reserve_storage_on_heap(8192);
 	}
 
 	// Vertex state
@@ -1112,7 +1158,7 @@ void GLGSRender::load_program(const gl::vertex_upload_info& upload_info)
 	*(reinterpret_cast<f32*>(buf + 144)) = rsx::method_registers.clip_max();
 	fill_vertex_layout_state(m_vertex_layout, upload_info.allocated_vertex_count, reinterpret_cast<s32*>(buf + 160), upload_info.persistent_mapping_offset, upload_info.volatile_mapping_offset);
 
-	if (m_transform_constants_dirty)
+	if (update_transform_constants)
 	{
 		// Vertex constants
 		mapping = m_transform_constants_buffer->alloc_from_heap(8192, m_uniform_buffer_offset_align);
@@ -1128,26 +1174,26 @@ void GLGSRender::load_program(const gl::vertex_upload_info& upload_info)
 	if (fragment_constants_size)
 	{
 		m_prog_buffer.fill_fragment_constants_buffer({ reinterpret_cast<float*>(buf), gsl::narrow<int>(fragment_constants_size) },
-				fragment_program, gl::get_driver_caps().vendor_NVIDIA);
+			current_fragment_program, gl::get_driver_caps().vendor_NVIDIA);
 	}
 
 	// Fragment state
-	fill_fragment_state_buffer(buf+fragment_constants_size, fragment_program);
+	fill_fragment_state_buffer(buf+fragment_constants_size, current_fragment_program);
 
 	m_vertex_state_buffer->bind_range(0, vertex_state_offset, 512);
 	m_fragment_constants_buffer->bind_range(2, fragment_constants_offset, fragment_buffer_size);
 
-	if (m_transform_constants_dirty) m_transform_constants_buffer->bind_range(1, vertex_constants_offset, 8192);
+	if (update_transform_constants) m_transform_constants_buffer->bind_range(1, vertex_constants_offset, 8192);
 
 	if (manually_flush_ring_buffers)
 	{
 		m_vertex_state_buffer->unmap();
 		m_fragment_constants_buffer->unmap();
 
-		if (m_transform_constants_dirty) m_transform_constants_buffer->unmap();
+		if (update_transform_constants) m_transform_constants_buffer->unmap();
 	}
 
-	m_transform_constants_dirty = false;
+	m_graphics_state = 0;
 }
 
 void GLGSRender::update_draw_state()
@@ -1264,7 +1310,7 @@ void GLGSRender::update_draw_state()
 	gl_state.enable(rsx::method_registers.poly_offset_fill_enabled(), GL_POLYGON_OFFSET_FILL);
 
 	//offset_bias is the constant factor, multiplied by the implementation factor R
-	//offst_scale is the slope factor, multiplied by the triangle slope factor M
+	//offset_scale is the slope factor, multiplied by the triangle slope factor M
 	gl_state.polygon_offset(rsx::method_registers.poly_offset_scale(), rsx::method_registers.poly_offset_bias());
 
 	if (gl_state.enable(rsx::method_registers.cull_face_enabled(), GL_CULL_FACE))
@@ -1370,7 +1416,7 @@ void GLGSRender::flip(int buffer)
 
 			if (!buffer_pitch) buffer_pitch = buffer_width * 4;
 			gl::pixel_unpack_settings unpack_settings;
-			unpack_settings.aligment(1).row_length(buffer_pitch / 4);
+			unpack_settings.alignment(1).row_length(buffer_pitch / 4);
 
 			if (!m_flip_tex_color || m_flip_tex_color->size2D() != sizei{ (int)buffer_width, (int)buffer_height })
 			{
@@ -1417,11 +1463,38 @@ void GLGSRender::flip(int buffer)
 		}
 	}
 
-	if (m_custom_ui)
+	if (m_overlay_manager)
 	{
-		gl::screen.bind();
-		glViewport(0, 0, m_frame->client_width(), m_frame->client_height());
-		m_ui_renderer.run(m_frame->client_width(), m_frame->client_height(), 0, *m_custom_ui.get());
+		if (m_overlay_manager->has_dirty())
+		{
+			m_overlay_manager->lock();
+
+			std::vector<u32> uids_to_dispose;
+			uids_to_dispose.reserve(m_overlay_manager->get_dirty().size());
+
+			for (const auto& view : m_overlay_manager->get_dirty())
+			{
+				m_ui_renderer.remove_temp_resources(view->uid);
+				uids_to_dispose.push_back(view->uid);
+			}
+
+			m_overlay_manager->unlock();
+			m_overlay_manager->dispose(uids_to_dispose);
+		}
+
+		if (m_overlay_manager->has_visible())
+		{
+			gl::screen.bind();
+			glViewport(0, 0, m_frame->client_width(), m_frame->client_height());
+
+			// Lock to avoid modification during run-update chain
+			std::lock_guard<rsx::overlays::display_manager> lock(*m_overlay_manager);
+
+			for (const auto& view : m_overlay_manager->get_views())
+			{
+				m_ui_renderer.run(m_frame->client_width(), m_frame->client_height(), 0, *view.get());
+			}
+		}
 	}
 
 	if (g_cfg.video.overlay)
@@ -1483,19 +1556,15 @@ bool GLGSRender::on_access_violation(u32 address, bool is_writing)
 		work_item &task = post_flush_request(address, result);
 
 		vm::temporary_unlock();
-		{
-			std::unique_lock<std::mutex> lock(task.guard_mutex);
-			task.cv.wait(lock, [&task] { return task.processed; });
-		}
+		task.producer_wait();
 
-		task.received = true;
 		return true;
 	}
 
 	return true;
 }
 
-void GLGSRender::on_notify_memory_unmapped(u32 address_base, u32 size)
+void GLGSRender::on_invalidate_memory_range(u32 address_base, u32 size)
 {
 	//Discard all memory in that range without bothering with writeback (Force it for strict?)
 	if (m_gl_texture_cache.invalidate_range(address_base, size, true, true, false).violation_handled)
@@ -1508,10 +1577,8 @@ void GLGSRender::on_notify_memory_unmapped(u32 address_base, u32 size)
 	}
 }
 
-void GLGSRender::do_local_task(bool /*idle*/)
+void GLGSRender::do_local_task(rsx::FIFO_state state)
 {
-	m_frame->clear_wm_events();
-
 	if (!work_queue.empty())
 	{
 		std::lock_guard<shared_mutex> lock(queue_guard);
@@ -1522,28 +1589,28 @@ void GLGSRender::do_local_task(bool /*idle*/)
 		{
 			if (q.processed) continue;
 
-			std::unique_lock<std::mutex> lock(q.guard_mutex);
 			q.result = m_gl_texture_cache.flush_all(q.section_data);
 			q.processed = true;
-
-			//Notify thread waiting on this
-			lock.unlock();
-			q.cv.notify_one();
 		}
 	}
-	else if (!in_begin_end)
+	else if (!in_begin_end && state != rsx::FIFO_state::lock_wait)
 	{
 		//This will re-engage locks and break the texture cache if another thread is waiting in access violation handler!
 		//Only call when there are no waiters
 		m_gl_texture_cache.do_update();
 	}
 
-	if (m_overlay_cleanup_requests.size())
+	rsx::thread::do_local_task(state);
+
+	if (state == rsx::FIFO_state::lock_wait)
 	{
-		m_ui_renderer.remove_temp_resources();
-		m_overlay_cleanup_requests.clear();
+		// Critical check finished
+		return;
 	}
-	else if (m_custom_ui)
+
+	m_frame->clear_wm_events();
+
+	if (m_overlay_manager)
 	{
 		if (!in_begin_end && native_ui_flip_request.load())
 		{
@@ -1575,8 +1642,13 @@ void GLGSRender::synchronize_buffers()
 
 bool GLGSRender::scaled_image_from_memory(rsx::blit_src_info& src, rsx::blit_dst_info& dst, bool interpolate)
 {
-	m_samplers_dirty.store(true);
-	return m_gl_texture_cache.blit(src, dst, interpolate, m_rtts);
+	if (m_gl_texture_cache.blit(src, dst, interpolate, m_rtts))
+	{
+		m_samplers_dirty.store(true);
+		return true;
+	}
+
+	return false;
 }
 
 void GLGSRender::notify_tile_unbound(u32 tile)
@@ -1585,6 +1657,11 @@ void GLGSRender::notify_tile_unbound(u32 tile)
 	//u32 addr = rsx::get_address(tiles[tile].offset, tiles[tile].location);
 	//on_notify_memory_unmapped(addr, tiles[tile].size);
 	//m_rtts.invalidate_surface_address(addr, false);
+
+	{
+		std::lock_guard<shared_mutex> lock(m_sampler_mutex);
+		m_samplers_dirty.store(true);
+	}
 }
 
 void GLGSRender::begin_occlusion_query(rsx::reports::occlusion_query_info* query)
@@ -1628,10 +1705,4 @@ void GLGSRender::discard_occlusion_query(rsx::reports::occlusion_query_info* que
 		//Discard is being called on an active query, close it
 		glEndQuery(GL_ANY_SAMPLES_PASSED);
 	}
-}
-
-void GLGSRender::shell_do_cleanup()
-{
-	//TODO: Key cleanup requests with UID to identify resources to remove
-	m_overlay_cleanup_requests.push_back(0);
 }
