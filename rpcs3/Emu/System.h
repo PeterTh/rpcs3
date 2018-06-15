@@ -323,6 +323,7 @@ struct cfg_root : cfg::node
 		cfg::_bool spu_shared_runtime{this, "SPU Shared Runtime", true}; // Share compiled SPU functions between all threads
 		cfg::_enum<spu_block_size_type> spu_block_size{this, "SPU Block Size"};
 		cfg::_bool spu_accurate_getllar{this, "Accurate GETLLAR", false};
+		cfg::_bool spu_accurate_putlluc{this, "Accurate PUTLLUC", false};
 		cfg::_bool spu_verification{this, "SPU Verification", true}; // Should be enabled
 		cfg::_bool spu_cache{this, "SPU Cache", true};
 
@@ -367,7 +368,7 @@ struct cfg_root : cfg::node
 		cfg::_bool debug_output{this, "Debug output"};
 		cfg::_bool overlay{this, "Debug overlay"};
 		cfg::_bool gl_legacy_buffers{this, "Use Legacy OpenGL Buffers"};
-		cfg::_bool use_gpu_texture_scaling{this, "Use GPU texture scaling", true};
+		cfg::_bool use_gpu_texture_scaling{this, "Use GPU texture scaling", false};
 		cfg::_bool stretch_to_display_area{this, "Stretch To Display Area"};
 		cfg::_bool force_high_precision_z_buffer{this, "Force High Precision Z buffer"};
 		cfg::_bool strict_rendering_mode{this, "Strict Rendering Mode"};

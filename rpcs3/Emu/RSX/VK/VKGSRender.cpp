@@ -1593,6 +1593,11 @@ void VKGSRender::on_init_thread()
 				owner->flip(0);
 			}
 
+			void refresh() override
+			{
+				dlg->refresh();
+			}
+
 			void close() override
 			{
 				dlg->return_code = CELL_OK;
