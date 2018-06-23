@@ -9,6 +9,9 @@
   <ItemGroup>
     <ClInclude Include="Emu\RSX\VK\VKGSRender.h">
       <Filter>Source Files</Filter>
+    </ClInclude>    
+    <ClInclude Include="Emu\RSX\VK\DuranteFrameLimiter.h">
+      <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\VK\VKCommonDecompiler.h">
       <Filter>Source Files</Filter>
@@ -43,7 +46,7 @@
     <ClInclude Include="Emu\RSX\VK\VKOverlays.h">
       <Filter>Source Files</Filter>
     </ClInclude>
-    <ClInclude Include="Emu\RSX\VK\DuranteFrameLimiter.h">
+    <ClInclude Include="Emu\RSX\VK\VKCompute.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

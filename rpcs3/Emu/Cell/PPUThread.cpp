@@ -1218,15 +1218,21 @@ extern void ppu_initialize()
 	}
 
 	// New PPU cache location
-	_main->cache = fmt::format("%sdata/%s/ppu-%s-%s/", fs::get_config_dir(), Emu.GetTitleID(), fmt::base57(_main->sha1), Emu.GetBoot().substr(Emu.GetBoot().find_last_of('/') + 1));
+	_main->cache = fs::get_config_dir() + "data/";
+
+	if (!Emu.GetTitleID().empty() && Emu.GetCat() != "1P")
+	{
+		// TODO
+		_main->cache += Emu.GetTitleID();
+		_main->cache += '/';
+	}
+
+	fmt::append(_main->cache, "ppu-%s-%s/", fmt::base57(_main->sha1), _main->path.substr(_main->path.find_last_of('/') + 1));
 
 	if (!fs::create_path(_main->cache))
 	{
 		fmt::throw_exception("Failed to create cache directory: %s (%s)", _main->cache, fs::g_tls_error);
 	}
-
-	// Initialize SPU cache
-	spu_cache::initialize();
 
 	if (Emu.IsStopped())
 	{
@@ -1248,6 +1254,9 @@ extern void ppu_initialize()
 	{
 		ppu_initialize(*ptr);
 	}
+
+	// Initialize SPU cache
+	spu_cache::initialize();
 }
 
 extern void ppu_initialize(const ppu_module& info)
