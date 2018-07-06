@@ -424,8 +424,7 @@ std::string SPUThread::dump() const
 {
 	std::string ret = cpu_thread::dump();
 
-	// Print some transaction statistics
-	fmt::append(ret, "\nBlocks: %u; Fail: %u", block_counter, block_failure);
+	fmt::append(ret, "\nBlock Weight: %u (Retreats: %u)", block_counter, block_failure);
 	fmt::append(ret, "\n[%s]", ch_mfc_cmd);
 	fmt::append(ret, "\nTag Mask: 0x%08x", ch_tag_mask);
 	fmt::append(ret, "\nMFC Stall: 0x%08x", ch_stall_mask);
@@ -528,7 +527,7 @@ void SPUThread::cpu_task()
 		}
 
 		// Print some stats
-		LOG_NOTICE(SPU, "Stats: block %u (fails: %u);", block_counter, block_failure);
+		LOG_NOTICE(SPU, "Stats: Block Weight: %u (Retreats: %u);", block_counter, block_failure);
 		return;
 	}
 
@@ -1442,6 +1441,13 @@ bool SPUThread::process_mfc_cmd(spu_mfc_cmd args)
 
 u32 SPUThread::get_events(bool waiting)
 {
+	const u32 mask1 = ch_event_mask;
+
+	if (mask1 & ~SPU_EVENT_IMPLEMENTED)
+	{
+		fmt::throw_exception("SPU Events not implemented (mask=0x%x)" HERE, mask1);
+	}
+
 	// Check reservation status and set SPU_EVENT_LR if lost
 	if (raddr && (vm::reservation_acquire(raddr, sizeof(rdata)) != rtime || rdata != vm::_ref<decltype(rdata)>(raddr)))
 	{
@@ -1459,9 +1465,9 @@ u32 SPUThread::get_events(bool waiting)
 	}
 
 	// Simple polling or polling with atomically set/removed SPU_EVENT_WAITING flag
-	return !waiting ? ch_event_stat & ch_event_mask : ch_event_stat.atomic_op([&](u32& stat) -> u32
+	return !waiting ? ch_event_stat & mask1 : ch_event_stat.atomic_op([&](u32& stat) -> u32
 	{
-		if (u32 res = stat & ch_event_mask)
+		if (u32 res = stat & mask1)
 		{
 			stat &= ~SPU_EVENT_WAITING;
 			return res;
@@ -1474,9 +1480,9 @@ u32 SPUThread::get_events(bool waiting)
 
 void SPUThread::set_events(u32 mask)
 {
-	if (u32 unimpl = mask & ~SPU_EVENT_IMPLEMENTED)
+	if (mask & ~SPU_EVENT_IMPLEMENTED)
 	{
-		fmt::throw_exception("Unimplemented events (0x%x)" HERE, unimpl);
+		fmt::throw_exception("SPU Events not implemented (mask=0x%x)" HERE, mask);
 	}
 
 	// Set new events, get old event mask
@@ -1493,11 +1499,12 @@ void SPUThread::set_interrupt_status(bool enable)
 {
 	if (enable)
 	{
-		// detect enabling interrupts with events masked
-		if (u32 mask = ch_event_mask & ~SPU_EVENT_INTR_IMPLEMENTED)
+		// Detect enabling interrupts with events masked
+		if (ch_event_mask & ~SPU_EVENT_INTR_IMPLEMENTED)
 		{
-			fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x)" HERE, mask);
+			fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x)" HERE, +ch_event_mask);
 		}
+
 		interrupts_enabled = true;
 	}
 	else
@@ -2007,29 +2014,12 @@ bool SPUThread::set_ch_value(u32 ch, u32 value)
 
 	case SPU_WrEventMask:
 	{
-		// detect masking events with enabled interrupt status
-		if (value & ~SPU_EVENT_INTR_IMPLEMENTED && interrupts_enabled)
-		{
-			fmt::throw_exception("SPU Interrupts not implemented (mask=0x%x)" HERE, value);
-		}
-
-		// detect masking unimplemented events
-		if (value & ~SPU_EVENT_IMPLEMENTED)
-		{
-			break;
-		}
-
 		ch_event_mask = value;
 		return true;
 	}
 
 	case SPU_WrEventAck:
 	{
-		if (value & ~SPU_EVENT_IMPLEMENTED)
-		{
-			break;
-		}
-
 		ch_event_stat &= ~value;
 		return true;
 	}
