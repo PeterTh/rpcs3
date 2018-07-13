@@ -351,7 +351,7 @@ void xinput_pad_handler::ThreadProc()
 
 			std::array<u16, XInputKeyCodes::KeyCodeCount> button_values = GetButtonValues(state);
 			
-			if(button_values[XInputKeyCodes::RS]) {
+			if(button_values[XInputKeyCodes::LS]) {
 				if(!prev_rs_state[padnum]) {
 					DuranteFrameLimiter::get().toggleLimit();
 					prev_rs_state[padnum] = true;
