@@ -552,7 +552,7 @@ bool FragmentProgramDecompiler::handle_sct(u32 opcode)
 	case RSX_FP_OPCODE_DP3: SetDst(getFunction(FUNCTION::FUNCTION_DP3)); return true;
 	case RSX_FP_OPCODE_DP4: SetDst(getFunction(FUNCTION::FUNCTION_DP4)); return true;
 	case RSX_FP_OPCODE_DP2A: SetDst(getFunction(FUNCTION::FUNCTION_DP2A)); return true;
-	case RSX_FP_OPCODE_MAD: SetDst("($0 * $1 + $2)"); return true;
+	case RSX_FP_OPCODE_MAD: SetDst("($0 * $1 + $2 /*BLA*/)"); return true;
 	case RSX_FP_OPCODE_MAX: SetDst("max($0, $1)"); return true;
 	case RSX_FP_OPCODE_MIN: SetDst("min($0, $1)"); return true;
 	case RSX_FP_OPCODE_MOV: SetDst("$0"); return true;
@@ -600,7 +600,7 @@ bool FragmentProgramDecompiler::handle_scb(u32 opcode)
 	case RSX_FP_OPCODE_LIF: SetDst(getFloatTypeName(4) + "(1.0, $0.y, ($0.y > 0 ? pow(2.0, $0.w) : 0.0), 1.0)"); return true;
 	case RSX_FP_OPCODE_LRP: SetDst(getFloatTypeName(4) + "($2 * (1 - $0) + $1 * $0)"); return true;
 	case RSX_FP_OPCODE_LG2: SetDst("log2(" + NotZeroPositive("$0.x") + ").xxxx"); return true;
-	case RSX_FP_OPCODE_MAD: SetDst("($0 * $1 + $2)"); return true;
+	case RSX_FP_OPCODE_MAD: SetDst("($0 * $1 + $2 /*ALB*/)"); return true;
 	case RSX_FP_OPCODE_MAX: SetDst("max($0, $1)"); return true;
 	case RSX_FP_OPCODE_MIN: SetDst("min($0, $1)"); return true;
 	case RSX_FP_OPCODE_MOV: SetDst("$0"); return true;
@@ -908,6 +908,12 @@ std::string FragmentProgramDecompiler::Decompile()
 			if (handle_tex_srb(opcode)) break;
 
 			//FENCT/FENCB do not actually reject instructions if they dont match the forced unit
+
+			if(forced_unit == FORCE_SCB && opcode == RSX_FP_OPCODE_MAD) {
+				SetDst("(($2.x==0.0f && $1.x==0.7f) ? $0 : $0 * $1 + $2 /* XILLIA */)");
+				break;
+			}
+
 			//Tested with Dark Souls II where the respecting FENCX instruction will result in empty luminance averaging shaders
 			//TODO: More research is needed to determine what real HW does
 			if (handle_sct(opcode)) break;

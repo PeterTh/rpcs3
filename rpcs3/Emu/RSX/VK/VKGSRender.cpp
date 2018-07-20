@@ -8,6 +8,8 @@
 #include "VKFormats.h"
 #include "VKCommonDecompiler.h"
 
+#include "Emu/RSX/VK/DuranteFrameLimiter.h"
+
 namespace
 {
 	u32 get_max_depth_value(rsx::surface_depth_format format)
@@ -3013,6 +3015,8 @@ void VKGSRender::reinitialize_swapchain()
 
 void VKGSRender::flip(int buffer)
 {
+	DuranteFrameLimiter::get().limit();
+
 	if (skip_frame || renderer_unavailable)
 	{
 		m_frame->flip(m_context);

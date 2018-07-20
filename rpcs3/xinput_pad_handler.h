@@ -133,6 +133,8 @@ private:
 	std::vector<std::pair<std::shared_ptr<XInputDevice>, std::shared_ptr<Pad>>> bindings;
 	std::shared_ptr<XInputDevice> m_dev;
 
+	bool prev_rs_state[4] = { false, false, false, false };
+
 	// holds internal controller state change
 	XINPUT_STATE state;
 	DWORD result;
