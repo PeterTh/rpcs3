@@ -168,7 +168,7 @@ namespace
 			gsl::span<gsl::byte> mapped_buffer_span = {
 				(gsl::byte*)mapped_buffer, gsl::narrow_cast<int>(buffer_size)};
 			write_vertex_array_data_to_buffer(mapped_buffer_span, vertex_array.data, vertex_count,
-				vertex_array.type, vertex_array.attribute_size, vertex_array.stride, element_size);
+				vertex_array.type, vertex_array.attribute_size, vertex_array.stride, element_size, vertex_array.is_be);
 
 			m_buffer_data.unmap(CD3DX12_RANGE(heap_offset, heap_offset + buffer_size));
 
@@ -262,7 +262,7 @@ namespace
 		std::function<attribute_storage(rsx::rsx_state, std::vector<std::pair<u32, u32>>)>
 			get_vertex_buffers,
 		ID3D12Resource* m_vertex_buffer_data, d3d12_data_heap& m_buffer_data,
-		gsl::not_null<ID3D12GraphicsCommandList*> command_list)
+		ID3D12GraphicsCommandList* command_list)
 	{
 		command_list->ResourceBarrier(1,
 			&CD3DX12_RESOURCE_BARRIER::Transition(m_vertex_buffer_data,

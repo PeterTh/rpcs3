@@ -648,8 +648,6 @@ namespace rsx
 				continue;
 			}
 
-			const u32 count = (cmd >> 18) & 0x7ff;
-
 			if ((cmd & RSX_METHOD_OLD_JUMP_CMD_MASK) == RSX_METHOD_OLD_JUMP_CMD)
 			{
 				u32 offs = cmd & 0x1ffffffc;
@@ -734,6 +732,8 @@ namespace rsx
 				continue;
 			}
 
+			u32 count = (cmd >> 18) & 0x7ff;
+
 			//Validate the args ptr if the command attempts to read from it
 			const u32 args_address = RSXIOMem.RealAddr(internal_get + 4);
 
@@ -762,10 +762,11 @@ namespace rsx
 			auto args = vm::ptr<u32>::make(args_address);
 			u32 first_cmd = (cmd & 0xfffc) >> 2;
 
-			// Not sure if this is worth trying to fix, but if it happens, its bad
-			// so logging it until its reported
-			if (internal_get < put && ((internal_get + (count + 1) * 4) > put))
-				LOG_ERROR(RSX, "Get pointer jumping over put pointer! This is bad!");
+			// Stop command execution if put will be equal to get ptr during the execution itself 
+			if (count * 4 + 4 > put - internal_get)
+			{
+				count = (put - internal_get) / 4 - 1;
+			}
 
 			if (performance_counters.state != FIFO_state::running)
 			{
@@ -1291,7 +1292,7 @@ namespace rsx
 			{
 				const rsx::data_array_format_info& info = state.vertex_arrays_info[index];
 				result.push_back(vertex_array_buffer{info.type(), info.size(), info.stride(),
-					get_raw_vertex_buffer(info, state.vertex_data_base_offset(), vertex_ranges), index});
+					get_raw_vertex_buffer(info, state.vertex_data_base_offset(), vertex_ranges), index, true});
 				continue;
 			}
 
@@ -1301,7 +1302,7 @@ namespace rsx
 				const u8 element_size = info.size * sizeof(u32);
 
 				gsl::span<const gsl::byte> vertex_src = { (const gsl::byte*)vertex_push_buffers[index].data.data(), vertex_push_buffers[index].vertex_count * element_size };
-				result.push_back(vertex_array_buffer{ info.type, info.size, element_size, vertex_src, index });
+				result.push_back(vertex_array_buffer{ info.type, info.size, element_size, vertex_src, index, false });
 				continue;
 			}
 
@@ -2059,7 +2060,10 @@ namespace rsx
 					}
 				}
 
-				result.texture_scale[i][3] = (f32)texture_control;
+#ifdef __APPLE__
+				texture_control |= (sampler_descriptors[i]->encoded_component_map() << 16);
+#endif
+				result.texture_scale[i][3] = (f32&)texture_control;
 			}
 		}
 
@@ -2412,8 +2416,6 @@ namespace rsx
 			s32 size = 0;
 			s32 attributes = 0;
 
-			bool is_be_type = true;
-
 			if (layout.attribute_placement[index] == attribute_buffer_placement::transient)
 			{
 				if (rsx::method_registers.current_draw_clause.command == rsx::draw_command::inlined_array)
@@ -2424,13 +2426,11 @@ namespace rsx
 
 					attributes = layout.interleaved_blocks[0].attribute_stride;
 					attributes |= default_frequency_mask | volatile_storage_mask;
-
-					is_be_type = false;
 				}
 				else
 				{
-					//Data is either from an immediate render or register input
-					//Immediate data overrides register input
+					// Data is either from an immediate render or register input
+					// Immediate data overrides register input
 
 					if (rsx::method_registers.current_draw_clause.is_immediate_draw &&
 						vertex_push_buffers[index].vertex_count > 1)
@@ -2441,20 +2441,16 @@ namespace rsx
 
 						attributes = rsx::get_vertex_type_size_on_host(type, size);
 						attributes |= default_frequency_mask | volatile_storage_mask;
-
-						is_be_type = true;
 					}
 					else
 					{
-						//Register
+						// Register
 						const auto& info = rsx::method_registers.register_vertex_info[index];
 						type = info.type;
 						size = info.size;
 
 						attributes = rsx::get_vertex_type_size_on_host(type, size);
 						attributes |= volatile_storage_mask;
-
-						is_be_type = false;
 					}
 				}
 			}
@@ -2474,8 +2470,10 @@ namespace rsx
 					{
 					case 0:
 					case 1:
+					{
 						attributes |= default_frequency_mask;
 						break;
+					}
 					default:
 					{
 						if (modulo_mask & (1 << index))
@@ -2483,24 +2481,30 @@ namespace rsx
 
 						attributes |= repeating_frequency_mask;
 						attributes |= (frequency << 13) & input_divisor_mask;
+						break;
 					}
 					}
 				}
 			} //end attribute placement check
 
+			// If data is passed via registers, it is already received in little endian
+			const bool is_be_type = (layout.attribute_placement[index] != attribute_buffer_placement::transient);
+			bool to_swap_bytes = is_be_type;
+
 			switch (type)
 			{
 			case rsx::vertex_base_type::cmp:
+				// Compressed 4 components into one 4-byte value
 				size = 1;
-				//fall through
-			default:
-				if (is_be_type) attributes |= swap_storage_mask;
 				break;
 			case rsx::vertex_base_type::ub:
 			case rsx::vertex_base_type::ub256:
-				if (!is_be_type) attributes |= swap_storage_mask;
+				// These are single byte formats, but inverted order (BGRA vs ARGB) when passed to inline array
+				to_swap_bytes = (rsx::method_registers.current_draw_clause.command == rsx::draw_command::inlined_array);
 				break;
 			}
+
+			if (to_swap_bytes) attributes |= swap_storage_mask;
 
 			buffer[index * 4 + 0] = static_cast<s32>(type);
 			buffer[index * 4 + 1] = size;
@@ -2525,7 +2529,7 @@ namespace rsx
 				return;
 			}
 
-			//NOTE: Order is important! Transient ayout is always push_buffers followed by register data
+			//NOTE: Order is important! Transient layout is always push_buffers followed by register data
 			if (draw_call.is_immediate_draw)
 			{
 				//NOTE: It is possible for immediate draw to only contain index data, so vertex data can be in persistent memory
