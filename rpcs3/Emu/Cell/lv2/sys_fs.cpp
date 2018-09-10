@@ -275,7 +275,7 @@ error_code sys_fs_open(vm::cptr<char> path, s32 flags, vm::ptr<u32> fd, s32 mode
 		open_mode = {}; // error
 	}
 
-	if (!test(open_mode))
+	if (!open_mode)
 	{
 		fmt::throw_exception("sys_fs_open(%s): Invalid or unimplemented flags: %#o" HERE, path, flags);
 	}
@@ -307,7 +307,7 @@ error_code sys_fs_open(vm::cptr<char> path, s32 flags, vm::ptr<u32> fd, s32 mode
 
 	if (!file)
 	{
-		if (test(open_mode & fs::excl) && fs::g_tls_error == fs::error::exist)
+		if (open_mode & fs::excl && fs::g_tls_error == fs::error::exist)
 		{
 			return not_an_error(CELL_EEXIST);
 		}
@@ -395,7 +395,7 @@ error_code sys_fs_read(u32 fd, vm::ptr<void> buf, u64 nbytes, vm::ptr<u64> nread
 		return CELL_EBADF;
 	}
 
-	std::lock_guard<std::mutex> lock(file->mp->mutex);
+	std::lock_guard lock(file->mp->mutex);
 
 	*nread = file->op_read(buf, nbytes);
 
@@ -413,7 +413,7 @@ error_code sys_fs_write(u32 fd, vm::cptr<void> buf, u64 nbytes, vm::ptr<u64> nwr
 		return CELL_EBADF;
 	}
 
-	std::lock_guard<std::mutex> lock(file->mp->mutex);
+	std::lock_guard lock(file->mp->mutex);
 
 	if (file->lock)
 	{
@@ -578,11 +578,41 @@ error_code sys_fs_stat(vm::cptr<char> path, vm::ptr<CellFsStat> sb)
 	{
 		switch (auto error = fs::g_tls_error)
 		{
-		case fs::error::noent: return {CELL_ENOENT, path};
-		default: sys_fs.error("sys_fs_stat(): unknown error %s", error);
-		}
+		case fs::error::noent:
+		{
+			// Try to analyse split file (TODO)
+			u64 total_size = 0;
+			u32 total_count = 0;
 
-		return {CELL_EIO, path};
+			for (u32 i = 66600; i <= 66699; i++)
+			{
+				if (fs::stat(fmt::format("%s.%u", local_path, i), info) && !info.is_directory)
+				{
+					total_size += info.size;
+					total_count++;
+				}
+				else
+				{
+					break;
+				}
+			}
+
+			// Use attributes from the first fragment (consistently with sys_fs_open+fstat)
+			if (total_count > 1 && fs::stat(local_path + ".66600", info) && !info.is_directory)
+			{
+				// Success
+				info.size = total_size;
+				break;
+			}
+
+			return {CELL_ENOENT, path};
+		}
+		default:
+		{
+			sys_fs.error("sys_fs_stat(): unknown error %s", error);
+			return {CELL_EIO, path};
+		}
+		}
 	}
 
 	sb->mode = info.is_directory ? CELL_FS_S_IFDIR | 0777 : CELL_FS_S_IFREG | 0666;
@@ -608,7 +638,7 @@ error_code sys_fs_fstat(u32 fd, vm::ptr<CellFsStat> sb)
 		return CELL_EBADF;
 	}
 
-	std::lock_guard<std::mutex> lock(file->mp->mutex);
+	std::lock_guard lock(file->mp->mutex);
 
 	const fs::stat_t& info = file->file.stat();
 
@@ -832,7 +862,7 @@ error_code sys_fs_fcntl(u32 fd, u32 op, vm::ptr<void> _arg, u32 _size)
 			return CELL_EBADF;
 		}
 
-		std::lock_guard<std::mutex> lock(file->mp->mutex);
+		std::lock_guard lock(file->mp->mutex);
 
 		if (op == 0x8000000b && file->lock)
 		{
@@ -1177,7 +1207,7 @@ error_code sys_fs_lseek(u32 fd, s64 offset, s32 whence, vm::ptr<u64> pos)
 		return CELL_EBADF;
 	}
 
-	std::lock_guard<std::mutex> lock(file->mp->mutex);
+	std::lock_guard lock(file->mp->mutex);
 
 	const u64 result = file->file.seek(offset, static_cast<fs::seek_mode>(whence));
 
@@ -1307,7 +1337,7 @@ error_code sys_fs_ftruncate(u32 fd, u64 size)
 		return CELL_EBADF;
 	}
 
-	std::lock_guard<std::mutex> lock(file->mp->mutex);
+	std::lock_guard lock(file->mp->mutex);
 
 	if (file->lock)
 	{

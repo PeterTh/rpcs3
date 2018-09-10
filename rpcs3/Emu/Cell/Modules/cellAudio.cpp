@@ -139,7 +139,7 @@ void audio_config::on_task()
 			{
 				if (first_mix)
 				{
-					for (u32 i = 0; i < (sizeof(buf2ch) / sizeof(float)); i += 2)
+					for (u32 i = 0; i < std::size(buf2ch); i += 2)
 					{
 						step_volume(port);
 
@@ -163,7 +163,7 @@ void audio_config::on_task()
 				}
 				else
 				{
-					for (u32 i = 0; i < (sizeof(buf2ch) / sizeof(float)); i += 2)
+					for (u32 i = 0; i < std::size(buf2ch); i += 2)
 					{
 						step_volume(port);
 
@@ -182,7 +182,7 @@ void audio_config::on_task()
 			{
 				if (first_mix)
 				{
-					for (u32 i = 0; i < (sizeof(buf2ch) / sizeof(float)); i += 2)
+					for (u32 i = 0; i < std::size(buf2ch); i += 2)
 					{
 						step_volume(port);
 
@@ -212,7 +212,7 @@ void audio_config::on_task()
 				}
 				else
 				{
-					for (u32 i = 0; i < (sizeof(buf2ch) / sizeof(float)); i += 2)
+					for (u32 i = 0; i < std::size(buf2ch); i += 2)
 					{
 						step_volume(port);
 
@@ -254,14 +254,14 @@ void audio_config::on_task()
 			// Copy output data (2ch or 8ch)
 			if (g_cfg.audio.downmix_to_2ch)
 			{
-				for (u32 i = 0; i < (sizeof(buf2ch) / sizeof(float)); i++)
+				for (u32 i = 0; i < std::size(buf2ch); i++)
 				{
 					out_buffer[out_pos][i] = buf2ch[i];
 				}
 			}
 			else
 			{
-				for (u32 i = 0; i < (sizeof(buf8ch) / sizeof(float)); i++)
+				for (u32 i = 0; i < std::size(buf8ch); i++)
 				{
 					out_buffer[out_pos][i] = buf8ch[i];
 				}
@@ -320,7 +320,7 @@ void audio_config::on_task()
 
 			// send aftermix event (normal audio event)
 
-			semaphore_lock lock(mutex);
+			std::lock_guard lock(mutex);
 
 			for (u64 key : keys)
 			{
@@ -748,7 +748,7 @@ error_code cellAudioSetNotifyEventQueue(u64 key)
 		return CELL_AUDIO_ERROR_NOT_INIT;
 	}
 
-	semaphore_lock lock(g_audio->mutex);
+	std::lock_guard lock(g_audio->mutex);
 
 	for (auto k : g_audio->keys) // check for duplicates
 	{
@@ -783,7 +783,7 @@ error_code cellAudioRemoveNotifyEventQueue(u64 key)
 		return CELL_AUDIO_ERROR_NOT_INIT;
 	}
 
-	semaphore_lock lock(g_audio->mutex);
+	std::lock_guard lock(g_audio->mutex);
 
 	for (auto i = g_audio->keys.begin(); i != g_audio->keys.end(); i++)
 	{
@@ -832,7 +832,7 @@ error_code cellAudioAddData(u32 portNum, vm::ptr<float> src, u32 samples, float 
 
 	const audio_port& port = g_audio->ports[portNum];
 
-	const auto dst = vm::ptr<float>::make(port.addr.addr() + u32(port.tag % port.block) * port.channel * 256 * SIZE_32(float));
+	const auto dst = vm::ptr<float>::make(port.addr.addr() + u32(port.tag % port.block) * port.channel * 256 * u32{sizeof(float)});
 
 	for (u32 i = 0; i < samples * port.channel; i++)
 	{
@@ -867,7 +867,7 @@ error_code cellAudioAdd2chData(u32 portNum, vm::ptr<float> src, u32 samples, flo
 
 	const audio_port& port = g_audio->ports[portNum];
 
-	const auto dst = vm::ptr<float>::make(port.addr.addr() + s32(port.tag % port.block) * port.channel * 256 * SIZE_32(float));
+	const auto dst = vm::ptr<float>::make(port.addr.addr() + s32(port.tag % port.block) * port.channel * 256 * u32{sizeof(float)});
 
 	if (port.channel == 2)
 	{
@@ -929,7 +929,7 @@ error_code cellAudioAdd6chData(u32 portNum, vm::ptr<float> src, float volume)
 
 	const audio_port& port = g_audio->ports[portNum];
 
-	const auto dst = vm::ptr<float>::make(port.addr.addr() + s32(port.tag % port.block) * port.channel * 256 * SIZE_32(float));
+	const auto dst = vm::ptr<float>::make(port.addr.addr() + s32(port.tag % port.block) * port.channel * 256 * u32{sizeof(float)});
 
 	if (port.channel == 6)
 	{

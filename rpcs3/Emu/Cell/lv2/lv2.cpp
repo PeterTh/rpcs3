@@ -518,7 +518,7 @@ const std::array<ppu_function_t, 1024> s_ppu_syscall_table
 	BIND_FUNC(sys_usbd_get_isochronous_transfer_status),    //546 (0x222)
 	BIND_FUNC(sys_usbd_get_device_location),                //547 (0x223)
 	BIND_FUNC(sys_usbd_send_event),                         //548 (0x224)
-	null_func,//BIND_FUNC(sys_ubsd_...)                     //549 (0x225)
+	BIND_FUNC(sys_usbd_event_port_send),                    //549 (0x225)
 	BIND_FUNC(sys_usbd_allocate_memory),                    //550 (0x226)
 	BIND_FUNC(sys_usbd_free_memory),                        //551 (0x227)
 	null_func,//BIND_FUNC(sys_ubsd_...)                     //552 (0x228)
@@ -1004,7 +1004,7 @@ DECLARE(lv2_obj::g_waiting);
 
 void lv2_obj::sleep_timeout(named_thread& thread, u64 timeout)
 {
-	semaphore_lock lock(g_mutex);
+	std::lock_guard lock(g_mutex);
 
 	const u64 start_time = get_system_time();
 
@@ -1012,15 +1012,18 @@ void lv2_obj::sleep_timeout(named_thread& thread, u64 timeout)
 	{
 		LOG_TRACE(PPU, "sleep() - waiting (%zu)", g_pending.size());
 
-		auto state = ppu->state.fetch_op([&](auto& val)
+		const auto [_, ok] = ppu->state.fetch_op([&](bs_t<cpu_flag>& val)
 		{
-			if (!test(val, cpu_flag::signal))
+			if (!(val & cpu_flag::signal))
 			{
 				val += cpu_flag::suspend;
+				return true;
 			}
+
+			return false;
 		});
 
-		if (test(state, cpu_flag::signal))
+		if (!ok)
 		{
 			LOG_TRACE(PPU, "sleep() failed (signaled)");
 			return;
@@ -1058,7 +1061,7 @@ void lv2_obj::awake(cpu_thread& cpu, u32 prio)
 	// Check thread type
 	if (cpu.id_type() != 1) return;
 
-	semaphore_lock lock(g_mutex);
+	std::lock_guard lock(g_mutex);
 
 	if (prio == -4)
 	{
@@ -1156,7 +1159,7 @@ void lv2_obj::schedule_all()
 		{
 			const auto target = g_ppu[i];
 
-			if (test(target->state, cpu_flag::suspend))
+			if (target->state & cpu_flag::suspend)
 			{
 				LOG_TRACE(PPU, "schedule(): %s", target->id);
 				target->state ^= (cpu_flag::signal + cpu_flag::suspend);

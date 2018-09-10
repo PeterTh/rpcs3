@@ -348,7 +348,7 @@ void ppu_thread::on_init(const std::shared_ptr<void>& _this)
 	if (!stack_addr)
 	{
 		// Allocate stack + gap between stacks
-		auto new_stack_base = vm::alloc(stack_size + 4096, vm::stack);
+		auto new_stack_base = vm::alloc(stack_size + 4096, vm::stack, 4096);
 		if (!new_stack_base)
 		{
 			fmt::throw_exception("Out of stack memory (size=0x%x)" HERE, stack_size);
@@ -607,7 +607,7 @@ void ppu_thread::exec_task()
 {
 	if (g_cfg.core.ppu_decoder == ppu_decoder_type::llvm)
 	{
-		while (!test(state, cpu_flag::ret + cpu_flag::exit + cpu_flag::stop + cpu_flag::dbg_global_stop))
+		while (!(state & (cpu_flag::ret + cpu_flag::exit + cpu_flag::stop + cpu_flag::dbg_global_stop)))
 		{
 			reinterpret_cast<ppu_function_t>(static_cast<std::uintptr_t>(ppu_ref(cia)))(*this);
 		}
@@ -625,7 +625,7 @@ void ppu_thread::exec_task()
 
 	while (true)
 	{
-		if (UNLIKELY(test(state)))
+		if (UNLIKELY(state))
 		{
 			if (check_state()) return;
 
@@ -678,7 +678,7 @@ void ppu_thread::exec_task()
 						func2 = func4;
 						func3 = func5;
 
-						if (UNLIKELY(test(state)))
+						if (UNLIKELY(state))
 						{
 							break;
 						}
@@ -763,9 +763,9 @@ cmd64 ppu_thread::cmd_wait()
 {
 	while (true)
 	{
-		if (UNLIKELY(test(state)))
+		if (UNLIKELY(state))
 		{
-			if (test(state, cpu_flag::stop + cpu_flag::exit))
+			if (state & (cpu_flag::stop + cpu_flag::exit))
 			{
 				return cmd64{};
 			}
@@ -808,7 +808,7 @@ void ppu_thread::fast_call(u32 addr, u32 rtoc)
 
 	auto at_ret = gsl::finally([&]()
 	{
-		if (std::uncaught_exception())
+		if (std::uncaught_exceptions())
 		{
 			if (last_function)
 			{
@@ -1550,7 +1550,7 @@ extern void ppu_initialize(const ppu_module& info)
 				continue;
 			}
 
-			semaphore_lock lock(jmutex);
+			std::lock_guard lock(jmutex);
 			jit->add(cache_path + obj_name);
 
 			LOG_SUCCESS(PPU, "LLVM: Loaded module %s", obj_name);
@@ -1568,7 +1568,7 @@ extern void ppu_initialize(const ppu_module& info)
 
 			// Allocate "core"
 			{
-				semaphore_lock jlock(jcores->sem);
+				std::lock_guard jlock(jcores->sem);
 
 				if (!Emu.IsStopped())
 				{
@@ -1586,7 +1586,7 @@ extern void ppu_initialize(const ppu_module& info)
 			}
 
 			// Proceed with original JIT instance
-			semaphore_lock lock(jmutex);
+			std::lock_guard lock(jmutex);
 			jit->add(cache_path + obj_name);
 		});
 	}
@@ -1605,7 +1605,7 @@ extern void ppu_initialize(const ppu_module& info)
 	// Jit can be null if the loop doesn't ever enter.
 	if (jit && jit_mod.vars.empty())
 	{
-		semaphore_lock lock(jmutex);
+		std::lock_guard lock(jmutex);
 		jit->fin();
 
 		// Get and install function addresses

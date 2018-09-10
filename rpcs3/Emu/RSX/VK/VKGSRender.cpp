@@ -100,7 +100,7 @@ namespace vk
 			VkComponentMapping no_alpha = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE };
 			return std::make_pair(VK_FORMAT_R8_UNORM, no_alpha);
 		}
-		
+
 		case rsx::surface_color_format::g8b8:
 		{
 			VkComponentMapping gb_rg = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G };
@@ -285,7 +285,7 @@ namespace vk
 			fmt::throw_exception("Unknown blend op: 0x%x" HERE, (u32)op);
 		}
 	}
-	
+
 
 	VkStencilOp get_stencil_op(rsx::stencil_op op)
 	{
@@ -322,7 +322,7 @@ namespace vk
 		case rsx::cull_face::back: return VK_CULL_MODE_BACK_BIT;
 		case rsx::cull_face::front: return VK_CULL_MODE_FRONT_BIT;
 		case rsx::cull_face::front_and_back: return VK_CULL_MODE_FRONT_AND_BACK;
-		default: 
+		default:
 			fmt::throw_exception("Unknown cull face value: 0x%x" HERE, (u32)cfv);
 		}
 	}
@@ -488,7 +488,7 @@ namespace
 VKGSRender::VKGSRender() : GSRender()
 {
 	u32 instance_handle = m_thread_context.createInstance("RPCS3");
-	
+
 	if (instance_handle > 0)
 	{
 		m_thread_context.makeCurrentInstance(instance_handle);
@@ -519,7 +519,13 @@ VKGSRender::VKGSRender() : GSRender()
 	display_handle_t display = m_frame->handle();
 
 #if !defined(_WIN32) && !defined(__APPLE__)
-	display.match([this](std::pair<Display*, Window> p) { m_display_handle = p.first; XFlush(m_display_handle); }, [](auto _) {});
+	std::visit([this](auto&& p) {
+		using T = std::decay_t<decltype(p)>;
+		if constexpr (std::is_same_v<T, std::pair<Display*, Window>>)
+		{
+			m_display_handle = p.first; XFlush(m_display_handle);
+		}
+	}, display);
 #endif
 
 	for (auto &gpu : gpus)
@@ -564,7 +570,7 @@ VKGSRender::VKGSRender() : GSRender()
 	}
 
 	m_current_command_buffer = &m_primary_cb_list[0];
-	
+
 	//Create secondary command_buffer for parallel operations
 	m_secondary_command_buffer_pool.create((*m_device));
 	m_secondary_command_buffer.create(m_secondary_command_buffer_pool, true);
@@ -777,7 +783,7 @@ VKGSRender::~VKGSRender()
 	//Device handles/contexts
 	m_swapchain->destroy();
 	m_thread_context.close();
-	
+
 #if !defined(_WIN32) && !defined(__APPLE__) && defined(HAVE_VULKAN)
 	if (m_display_handle)
 		XCloseDisplay(m_display_handle);
@@ -788,7 +794,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 {
 	vk::texture_cache::thrashed_set result;
 	{
-		std::lock_guard<shared_mutex> lock(m_secondary_cb_guard);
+		std::lock_guard lock(m_secondary_cb_guard);
 		result = std::move(m_texture_cache.invalidate_address(address, is_writing, false, m_secondary_command_buffer, m_swapchain->get_graphics_queue()));
 	}
 
@@ -796,7 +802,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 		return false;
 
 	{
-		std::lock_guard<shared_mutex> lock(m_sampler_mutex);
+		std::lock_guard lock(m_sampler_mutex);
 		m_samplers_dirty.store(true);
 	}
 
@@ -814,7 +820,7 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 			//Always submit primary cb to ensure state consistency (flush pending changes such as image transitions)
 			vm::temporary_unlock();
 
-			std::lock_guard<shared_mutex> lock(m_flush_queue_mutex);
+			std::lock_guard lock(m_flush_queue_mutex);
 
 			m_flush_requests.post(sync_timestamp == 0ull);
 			has_queue_ref = true;
@@ -872,13 +878,13 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
 
 void VKGSRender::on_invalidate_memory_range(u32 address_base, u32 size)
 {
-	std::lock_guard<shared_mutex> lock(m_secondary_cb_guard);
+	std::lock_guard lock(m_secondary_cb_guard);
 	if (m_texture_cache.invalidate_range(address_base, size, true, true, false,
 		m_secondary_command_buffer, m_swapchain->get_graphics_queue()).violation_handled)
 	{
 		m_texture_cache.purge_dirty();
 		{
-			std::lock_guard<shared_mutex> lock(m_sampler_mutex);
+			std::lock_guard lock(m_sampler_mutex);
 			m_samplers_dirty.store(true);
 		}
 	}
@@ -892,7 +898,7 @@ void VKGSRender::notify_tile_unbound(u32 tile)
 	//m_rtts.invalidate_surface_address(addr, false);
 
 	{
-		std::lock_guard<shared_mutex> lock(m_sampler_mutex);
+		std::lock_guard lock(m_sampler_mutex);
 		m_samplers_dirty.store(true);
 	}
 }
@@ -1183,7 +1189,7 @@ void VKGSRender::end()
 
 	//Load textures
 	{
-		std::lock_guard<shared_mutex> lock(m_sampler_mutex);
+		std::lock_guard lock(m_sampler_mutex);
 		bool update_framebuffer_sourced = false;
 
 		if (surface_store_tag != m_rtts.cache_tag)
@@ -1480,7 +1486,7 @@ void VKGSRender::end()
 		const u32 index_count = upload_info.vertex_draw_count;
 		VkDeviceSize offset;
 
-		std::tie(offset, index_type) = upload_info.index_info.value();
+		std::tie(offset, index_type) = *upload_info.index_info;
 		vkCmdBindIndexBuffer(*m_current_command_buffer, m_index_buffer_ring_info.heap->value, offset, index_type);
 
 		if (single_draw)
@@ -1643,7 +1649,7 @@ void VKGSRender::on_init_thread()
 void VKGSRender::on_exit()
 {
 	zcull_ctrl.release();
-	return GSRender::on_exit();
+	GSRender::on_exit();
 }
 
 void VKGSRender::clear_surface(u32 mask)
@@ -1838,7 +1844,7 @@ void VKGSRender::flush_command_queue(bool hard_sync)
 	{
 		//Mark this queue as pending
 		m_current_command_buffer->pending = true;
-		
+
 		//Grab next cb in line and make it usable
 		m_current_cb_index = (m_current_cb_index + 1) % VK_MAX_ASYNC_CB_COUNT;
 		m_current_command_buffer = &m_primary_cb_list[m_current_cb_index];
@@ -2054,7 +2060,7 @@ void VKGSRender::do_local_task(rsx::FIFO_state state)
 {
 	if (m_flush_requests.pending())
 	{
-		std::lock_guard<shared_mutex> lock(m_flush_queue_mutex);
+		std::lock_guard lock(m_flush_queue_mutex);
 
 		//TODO: Determine if a hard sync is necessary
 		//Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
@@ -2521,7 +2527,7 @@ void VKGSRender::close_and_submit_command_buffer(const std::vector<VkSemaphore> 
 		m_transform_constants_ring_info.dirty() ||
 		m_texture_upload_buffer_ring_info.dirty())
 	{
-		std::lock_guard<shared_mutex> lock(m_secondary_cb_guard);
+		std::lock_guard lock(m_secondary_cb_guard);
 		m_secondary_command_buffer.begin();
 
 		m_attrib_ring_info.sync(m_secondary_command_buffer);
@@ -3082,7 +3088,7 @@ void VKGSRender::flip(int buffer)
 		if (has_overlay)
 		{
 			// Lock to avoid modification during run-update chain
-			std::lock_guard<rsx::overlays::display_manager> lock(*m_overlay_manager);
+			std::lock_guard lock(*m_overlay_manager);
 
 			for (const auto& view : m_overlay_manager->get_views())
 			{

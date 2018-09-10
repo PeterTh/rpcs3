@@ -1160,7 +1160,7 @@ namespace rsx
 		template <typename ...Args>
 		void lock_memory_region(image_storage_type* image, u32 memory_address, u32 memory_size, u32 width, u32 height, u32 pitch, Args&&... extras)
 		{
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 			section_storage_type& region = find_cached_texture(memory_address, memory_size, false);
 
 			if (region.get_context() != texture_upload_context::framebuffer_storage &&
@@ -1240,7 +1240,7 @@ namespace rsx
 
 		void set_memory_read_flags(u32 memory_address, u32 memory_size, memory_read_flags flags)
 		{
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 
 			if (flags != memory_read_flags::flush_always)
 				m_flush_always_cache.erase(memory_address);
@@ -1259,7 +1259,7 @@ namespace rsx
 		template <typename ...Args>
 		bool flush_memory_to_cache(u32 memory_address, u32 memory_size, bool skip_synchronized, u32 allowed_types_mask, Args&&... extra)
 		{
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 			section_storage_type* region = find_flushable_section(memory_address, memory_size);
 
 			//Check if section was released, usually if cell overwrites a currently bound render target
@@ -1353,7 +1353,7 @@ namespace rsx
 			if (!region_intersects_cache(address, range, is_writing))
 				return{};
 
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 			return invalidate_range_impl_base(address, range, is_writing, false, allow_flush, std::forward<Args>(extras)...);
 		}
 
@@ -1364,14 +1364,14 @@ namespace rsx
 			if (!region_intersects_cache(address, range, is_writing))
 				return {};
 
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 			return invalidate_range_impl_base(address, range, is_writing, discard, allow_flush, std::forward<Args>(extras)...);
 		}
 
 		template <typename ...Args>
 		bool flush_all(thrashed_set& data, Args&&... extras)
 		{
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 
 			if (m_cache_update_tag.load(std::memory_order_consume) == data.cache_tag)
 			{
@@ -1483,7 +1483,7 @@ namespace rsx
 
 		void purge_dirty()
 		{
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 
 			//Reclaims all graphics memory consumed by dirty textures
 			std::vector<u32> empty_addresses;
@@ -2033,7 +2033,7 @@ namespace rsx
 			}
 
 			//Do direct upload from CPU as the last resort
-			writer_lock lock(m_cache_mutex);
+			std::lock_guard lock(m_cache_mutex);
 			const bool is_swizzled = !(tex.format() & CELL_GCM_TEXTURE_LN);
 			auto subresources_layout = get_subresources_layout(tex);
 
@@ -2222,12 +2222,15 @@ namespace rsx
 
 			if (!dst_is_render_target)
 			{
-				//Check for any available region that will fit this one
+				// Check for any available region that will fit this one
 				auto overlapping_surfaces = find_texture_from_range(dst_address, dst.pitch * dst.clip_height);
 
 				for (const auto &surface : overlapping_surfaces)
 				{
 					if (surface->get_context() != rsx::texture_upload_context::blit_engine_dst)
+						continue;
+
+					if (surface->rsx_pitch != dst.pitch)
 						continue;
 
 					const auto old_dst_area = dst_area;
@@ -2244,17 +2247,15 @@ namespace rsx
 						dst_area.y2 += offset_y;
 					}
 
-					//Validate clipping region
+					// Validate clipping region
 					if ((unsigned)dst_area.x2 <= surface->get_width() &&
 						(unsigned)dst_area.y2 <= surface->get_height())
 					{
 						cached_dest = surface;
 						break;
 					}
-					else
-					{
-						dst_area = old_dst_area;
-					}
+
+					dst_area = old_dst_area;
 				}
 
 				if (cached_dest)
@@ -2299,9 +2300,12 @@ namespace rsx
 						surface->get_context() == rsx::texture_upload_context::framebuffer_storage)
 						continue;
 
+					if (surface->rsx_pitch != src.pitch)
+						continue;
+
 					if (const u32 address_offset = src_address - surface->get_section_base())
 					{
-						const u16 bpp = dst_is_argb8 ? 4 : 2;
+						const u16 bpp = src_is_argb8 ? 4 : 2;
 						const u16 offset_y = address_offset / src.pitch;
 						const u16 offset_x = address_offset % src.pitch;
 						const u16 offset_x_in_block = offset_x / bpp;
@@ -2412,17 +2416,6 @@ namespace rsx
 			if (format_mismatch)
 			{
 				lock.upgrade();
-
-				//Mark for removal as the memory is not reusable now
-				if (cached_dest->is_locked())
-				{
-					cached_dest->unprotect();
-					m_cache[get_block_address(cached_dest->get_section_base())].remove_one();
-				}
-
-				cached_dest->set_dirty(true);
-				m_unreleased_texture_objects++;
-
 				invalidate_range_impl_base(cached_dest->get_section_base(), cached_dest->get_section_size(), true, false, true, std::forward<Args>(extras)...);
 
 				dest_texture = 0;
@@ -2488,16 +2481,11 @@ namespace rsx
 
 			if (cached_dest)
 			{
-				const bool notify = !cached_dest->is_locked();
-				const u32 mem_base = dst_area.y1 * dst.pitch;
-				const u32 mem_length = (dst.clip_height == 1)?
-					dst.clip_width * (dst_is_argb8? 4 : 2) :    // Lock full rows if its a rectangular section
-					dst.pitch * dst.clip_height;                // Lock only part of fist row if simple 1D array
-
 				lock.upgrade();
 
-				if (notify)
+				if (!cached_dest->is_locked())
 				{
+					// Notify
 					m_cache[get_block_address(cached_dest->get_section_base())].notify();
 				}
 				else if (cached_dest->is_synchronized())
@@ -2505,6 +2493,21 @@ namespace rsx
 					// Premature readback
 					m_num_cache_mispredictions++;
 				}
+
+				u32 mem_length;
+				const u32 mem_base = dst_address - cached_dest->get_section_base();
+
+				if (dst.clip_height == 1)
+				{
+					mem_length = dst.clip_width * (dst_is_argb8 ? 4 : 2);
+				}
+				else
+				{
+					const u32 mem_excess = mem_base % dst.pitch;
+					mem_length = (dst.pitch * dst.clip_height) - mem_excess;
+				}
+
+				verify(HERE), (mem_base + mem_length) <= cached_dest->get_section_size();
 
 				cached_dest->reprotect(utils::protection::no, { mem_base, mem_length });
 				cached_dest->touch();
@@ -2575,7 +2578,7 @@ namespace rsx
 			{
 				if (m_cache_update_tag.load(std::memory_order_consume) != m_flush_always_update_timestamp)
 				{
-					writer_lock lock(m_cache_mutex);
+					std::lock_guard lock(m_cache_mutex);
 					bool update_tag = false;
 
 					for (const auto &It : m_flush_always_cache)
@@ -2587,6 +2590,7 @@ namespace rsx
 							{
 								//NOTE: find_cached_texture will increment block ctr
 								section.reprotect(utils::protection::no);
+								tag_framebuffer(It.first);
 								update_tag = true;
 							}
 							else
