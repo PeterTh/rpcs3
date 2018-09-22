@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
@@ -18,6 +18,9 @@
 #include "Utilities/GSL.h"
 #include "Utilities/StrUtil.h"
 
+#include <cereal/archives/binary.hpp>
+
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 #include <fenv.h>
@@ -364,6 +367,11 @@ namespace rsx
 		}
 	}
 
+	void thread::on_spawn()
+	{
+		m_rsx_thread = std::this_thread::get_id();
+	}
+
 	void thread::on_task()
 	{
 		if (supports_native_ui)
@@ -388,7 +396,7 @@ namespace rsx
 
 		on_init_thread();
 
-		reset();
+		method_registers.init();
 
 		if (!zcull_ctrl)
 		{
@@ -483,9 +491,6 @@ namespace rsx
 		s32 deferred_begin_end = 0;
 		std::vector<u32> deferred_stack;
 		bool has_deferred_call = false;
-
-		// Track register address faults
-		u32 mem_faults_count = 0;
 
 		auto flush_command_queue = [&]()
 		{
@@ -631,18 +636,13 @@ namespace rsx
 			}
 			else
 			{
-				LOG_ERROR(RSX, "Invalid FIFO queue get/put registers found, get=0x%X, put=0x%X", internal_get.load(), put);
+				std::this_thread::sleep_for(33ms);
 
-				if (mem_faults_count >= 3)
+				if (!RSXIOMem.RealAddr(internal_get))
 				{
-					LOG_ERROR(RSX, "Application has failed to recover, resetting FIFO queue");
+					LOG_ERROR(RSX, "Invalid FIFO queue get/put registers found: get=0x%X, put=0x%X; Resetting...", +internal_get, put);
 					internal_get = restore_point.load();
 					m_return_addr = restore_ret_addr;
-				}
-				else
-				{
-					mem_faults_count++;
-					std::this_thread::sleep_for(10ms);
 				}
 
 				continue;
@@ -735,31 +735,22 @@ namespace rsx
 			u32 count = (cmd >> 18) & 0x7ff;
 
 			//Validate the args ptr if the command attempts to read from it
-			const u32 args_address = RSXIOMem.RealAddr(internal_get + 4);
+			auto args = vm::ptr<u32>::make(RSXIOMem.RealAddr(internal_get + 4));
 
-			if (!args_address && count)
+			if (!args && count)
 			{
-				LOG_ERROR(RSX, "Invalid FIFO queue args ptr found, get=0x%X, cmd=0x%X, count=%d", internal_get.load(), cmd, count);
+				std::this_thread::sleep_for(33ms);
 
-				if (mem_faults_count >= 3)
+				if (!RSXIOMem.RealAddr(internal_get + 4))
 				{
-					LOG_ERROR(RSX, "Application has failed to recover, resetting FIFO queue");
+					LOG_ERROR(RSX, "Invalid FIFO queue args ptr found: get=0x%X, put=0x%X, count=%d; Resetting...", +internal_get, put, count);
 					internal_get = restore_point.load();
 					m_return_addr = restore_ret_addr;
-				}
-				else
-				{
-					mem_faults_count++;
-					std::this_thread::sleep_for(10ms);
 				}
 
 				continue;
 			}
 
-			// All good on valid memory ptrs
-			mem_faults_count = 0;
-
-			auto args = vm::ptr<u32>::make(args_address);
 			u32 first_cmd = (cmd & 0xfffc) >> 2;
 
 			// Stop command execution if put will be equal to get ptr during the execution itself
@@ -1365,6 +1356,11 @@ namespace rsx
 
 	void thread::do_local_task(FIFO_state state)
 	{
+		if (async_flip_requested & flip_request::any)
+		{
+			handle_emu_flip(async_flip_buffer);
+		}
+
 		if (!in_begin_end && state != FIFO_state::lock_wait)
 		{
 			if (!m_invalidated_memory_ranges.empty())
@@ -1946,11 +1942,6 @@ namespace rsx
 		auto &result = current_fragment_program = {};
 
 		const u32 shader_program = rsx::method_registers.shader_program_address();
-		if (shader_program == 0)
-		{
-			current_fp_metadata = {};
-			return;
-		}
 
 		const u32 program_location = (shader_program & 0x3) - 1;
 		const u32 program_offset = (shader_program & ~0x3);
@@ -2083,9 +2074,6 @@ namespace rsx
 		auto &result = current_fragment_program = {};
 
 		const u32 shader_program = rsx::method_registers.shader_program_address();
-		if (shader_program == 0)
-			return;
-
 		const u32 program_location = (shader_program & 0x3) - 1;
 		const u32 program_offset = (shader_program & ~0x3);
 
@@ -2583,6 +2571,8 @@ namespace rsx
 
 	void thread::flip(int buffer)
 	{
+		async_flip_requested.clear();
+
 		if (g_cfg.video.frame_skip_enabled)
 		{
 			m_skip_frame_ctr++;
@@ -2764,6 +2754,133 @@ namespace rsx
 
 		return performance_counters.approximate_load;
 	}
+
+	void thread::request_emu_flip(u32 buffer)
+	{
+		const bool is_rsxthr = std::this_thread::get_id() == m_rsx_thread;
+
+		// requested through command buffer
+		if (is_rsxthr)
+		{
+			// NOTE: The flip will clear any queued flip requests
+			handle_emu_flip(buffer);
+		}
+		else // requested 'manually' through ppu syscall
+		{
+			if (async_flip_requested & flip_request::emu_requested)
+			{
+				// ignore multiple requests until previous happens
+				return;
+			}
+
+			async_flip_buffer = buffer;
+			async_flip_requested |= flip_request::emu_requested;
+		}
+	}
+
+	void thread::handle_emu_flip(u32 buffer)
+	{
+		if (user_asked_for_frame_capture && !g_cfg.video.strict_rendering_mode)
+		{
+			// not dealing with non-strict rendering capture for now
+			user_asked_for_frame_capture = false;
+			LOG_FATAL(RSX, "RSX Capture: Capture only supported when ran with strict rendering mode.");
+		}
+		else if (user_asked_for_frame_capture && !capture_current_frame)
+		{
+			capture_current_frame = true;
+			user_asked_for_frame_capture = false;
+			frame_debug.reset();
+			frame_capture.reset();
+
+			// random number just to jumpstart the size
+			frame_capture.replay_commands.reserve(8000);
+
+			// capture first tile state with nop cmd
+			rsx::frame_capture_data::replay_command replay_cmd;
+			replay_cmd.rsx_command = std::make_pair(NV4097_NO_OPERATION, 0);
+			frame_capture.replay_commands.push_back(replay_cmd);
+			capture::capture_display_tile_state(this, frame_capture.replay_commands.back());
+		}
+		else if (capture_current_frame)
+		{
+			capture_current_frame = false;
+			std::stringstream os;
+			cereal::BinaryOutputArchive archive(os);
+			const std::string& filePath = fs::get_config_dir() + "capture.rrc";
+			archive(frame_capture);
+			{
+				// todo: 'dynamicly' create capture filename, also may want to compress this data?
+				fs::file f(filePath, fs::rewrite);
+				f.write(os.str());
+			}
+
+			LOG_SUCCESS(RSX, "capture successful: %s", filePath.c_str());
+
+			frame_capture.reset();
+			Emu.Pause();
+		}
+
+		double limit = 0.;
+		switch (g_cfg.video.frame_limit)
+		{
+		case frame_limit_type::none: limit = 0.; break;
+		case frame_limit_type::_59_94: limit = 59.94; break;
+		case frame_limit_type::_50: limit = 50.; break;
+		case frame_limit_type::_60: limit = 60.; break;
+		case frame_limit_type::_30: limit = 30.; break;
+		case frame_limit_type::_auto: limit = fps_limit; break; // TODO
+		}
+
+		if (limit)
+		{
+			const u64 time = get_system_time() - Emu.GetPauseTime() - start_rsx_time;
+
+			if (int_flip_index == 0)
+			{
+				start_rsx_time = time;
+			}
+			else
+			{
+				// Convert limit to expected time value
+				double expected = int_flip_index * 1000000. / limit;
+
+				while (time >= expected + 1000000. / limit)
+				{
+					expected = int_flip_index++ * 1000000. / limit;
+				}
+
+				if (expected > time + 1000)
+				{
+					const auto delay_us = static_cast<s64>(expected - time);
+					std::this_thread::sleep_for(std::chrono::milliseconds{ delay_us / 1000 });
+					performance_counters.idle_time += delay_us;
+				}
+			}
+		}
+
+		int_flip_index++;
+		current_display_buffer = buffer;
+		flip(buffer);
+
+		last_flip_time = get_system_time() - 1000000;
+		flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;
+
+		if (flip_handler)
+		{
+			intr_thread->cmd_list
+			({
+				{ ppu_cmd::set_args, 1 }, u64{ 1 },
+				{ ppu_cmd::lle_call, flip_handler },
+				{ ppu_cmd::sleep, 0 }
+			});
+
+			intr_thread->notify();
+		}
+
+		sys_rsx_context_attribute(0x55555555, 0xFEC, buffer, 0, 0, 0);
+	}
+
 
 	namespace reports
 	{
@@ -3209,11 +3326,12 @@ namespace rsx
 			const auto memory_end = memory_address + memory_range;
 			u32 sync_address = 0;
 
-			for (const auto &writer : m_pending_writes)
+			for (auto It = m_pending_writes.crbegin(); It != m_pending_writes.crend(); ++It)
 			{
-				if (writer.sink >= memory_address && writer.sink < memory_end)
+				if (It->sink >= memory_address && It->sink < memory_end)
 				{
-					sync_address = writer.sink;
+					sync_address = It->sink;
+					break;
 				}
 			}
 

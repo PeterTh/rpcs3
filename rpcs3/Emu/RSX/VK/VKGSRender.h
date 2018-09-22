@@ -364,7 +364,6 @@ private:
 	shared_mutex m_flush_queue_mutex;
 	flush_request_task m_flush_requests;
 
-	std::thread::id rsx_thread;
 	std::atomic<u64> m_last_sync_event = { 0 };
 
 	bool render_pass_open = false;
@@ -404,7 +403,6 @@ private:
 	vk::vertex_upload_info upload_vertex_data();
 
 public:
-	bool check_program_status();
 	bool load_program();
 	void load_program_env(const vk::vertex_upload_info& vertex_info);
 	void init_buffers(rsx::framebuffer_creation_context context, bool skip_reading = false);
