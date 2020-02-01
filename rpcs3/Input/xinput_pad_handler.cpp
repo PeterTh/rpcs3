@@ -2,6 +2,8 @@
 #ifdef _WIN32
 #include "xinput_pad_handler.h"
 
+#include "Emu/RSX/GL/DuranteFrameLimiter.h"
+
 namespace XINPUT_INFO
 {
 	const DWORD GUIDE_BUTTON = 0x0400;
@@ -154,7 +156,7 @@ int xinput_pad_handler::GetDeviceNumber(const std::string& padId)
 	return device_number;
 }
 
-std::unordered_map<u64, u16> xinput_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
+xinput_pad_handler::PadButtonValues xinput_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& device)
 {
 	PadButtonValues values;
 	auto dev = std::static_pointer_cast<XInputDevice>(device);
@@ -164,10 +166,26 @@ std::unordered_map<u64, u16> xinput_pad_handler::get_button_values(const std::sh
 	// Try SCP first, if it fails for that pad then try normal XInput
 	if (dev->is_scp_device)
 	{
-		return get_button_values_scp(dev->state_scp);
+		values = get_button_values_scp(dev->state_scp);
 	}
 
-	return get_button_values_base(dev->state_base);
+	values = get_button_values_base(dev->state_base);
+	
+	if (values[XInputKeyCodes::RS])
+	{
+		if (!dev->prev_rs_state)
+		{
+			DuranteFrameLimiter::get().toggleLimit();
+			dev->prev_rs_state = true;
+			//	LOG_ERROR(HLE, "TOGGLE");
+		}
+	}
+	else
+	{
+		dev->prev_rs_state = false;
+	}
+
+	return values;
 }
 
 xinput_pad_handler::PadButtonValues xinput_pad_handler::get_button_values_base(const XINPUT_STATE& state)

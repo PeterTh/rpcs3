@@ -11,6 +11,7 @@
     <ClCompile Include="Emu\RSX\GL\GLPresent.cpp" />
     <ClCompile Include="Emu\RSX\GL\GLRenderTargets.cpp" />
     <ClCompile Include="Emu\RSX\GL\GLVertexBuffers.cpp" />
+    <ClCompile Include="Emu\RSX\GL\DuranteFrameLimiter.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Emu\RSX\GL\GLTexture.h" />
@@ -28,5 +29,6 @@
     <ClInclude Include="Emu\RSX\GL\GLOverlays.h" />
     <ClInclude Include="Emu\RSX\GL\GLExecutionState.h" />
     <ClInclude Include="Emu\RSX\GL\GLCompute.h" />
+    <ClInclude Include="Emu\RSX\GL\DuranteFrameLimiter.h" />
   </ItemGroup>
 </Project>

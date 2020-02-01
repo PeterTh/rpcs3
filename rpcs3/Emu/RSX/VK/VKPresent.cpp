@@ -1,6 +1,7 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "VKGSRender.h"
 
+#include "Emu/RSX/GL/DuranteFrameLimiter.h"
 
 void VKGSRender::reinitialize_swapchain()
 {
@@ -346,6 +347,8 @@ vk::image* VKGSRender::get_present_source(vk::present_surface_info* info, const 
 
 void VKGSRender::flip(const rsx::display_flip_info_t& info)
 {
+	DuranteFrameLimiter::get().limit();
+
 	// Check swapchain condition/status
 	if (!m_swapchain->supports_automatic_wm_reports())
 	{

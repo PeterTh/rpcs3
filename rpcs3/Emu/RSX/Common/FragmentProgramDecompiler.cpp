@@ -1207,6 +1207,12 @@ std::string FragmentProgramDecompiler::Decompile()
 			if (SIP()) break;
 			if (handle_tex_srb(opcode)) break;
 
+			// Xillia
+			if(forced_unit == FORCE_SCB && opcode == RSX_FP_OPCODE_MAD) {
+				SetDst("(($2.x==0.0f && $1.x==0.7f) ? $0 : fma($0, $1, $2) /* XILLIA */)");
+				break;
+			}
+
 			// FENCT/FENCB do not actually reject instructions if they dont match the forced unit
 			// Looks like they are optimization hints and not hard-coded forced paths
 			if (handle_sct_scb(opcode)) break;

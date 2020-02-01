@@ -1,5 +1,7 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "GLGSRender.h"
+
+#include "DuranteFrameLimiter.h"
 
 LOG_CHANNEL(screenshot);
 
@@ -84,6 +86,8 @@ GLuint GLGSRender::get_present_source(gl::present_surface_info* info, const rsx:
 
 void GLGSRender::flip(const rsx::display_flip_info_t& info)
 {
+	DuranteFrameLimiter::get().limit();
+
 	if (info.skip_frame)
 	{
 		m_frame->flip(m_context, true);

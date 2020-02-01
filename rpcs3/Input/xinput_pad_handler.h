@@ -90,6 +90,8 @@ class xinput_pad_handler final : public PadHandlerBase
 		DWORD state{ ERROR_NOT_CONNECTED }; // holds internal controller state change
 		SCP_EXTN state_scp{ 0 };
 		XINPUT_STATE state_base{ 0 };
+
+		bool prev_rs_state = false;
 	};
 
 public:
